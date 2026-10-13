@@ -20,6 +20,22 @@ from wa_ui.taskmgr_tile_theme import (
     taskmgr_sort_jobs_for_display,
     taskmgr_tile_palette,
 )
+from i18n.job_card import format_job_status_label, operator_note_for_items
+from i18n.pause_reason import CODE_MANUAL, display_pause_reason, is_await_image_send
+from ..one_click_image import (
+    MAX_BULK_IMAGES,
+    collect_awaiting_image_jobs,
+    group_awaiting_by_day,
+    notes_for_awaiting_jobs,
+)
+from i18n import get_lang, set_lang_for_next_launch, t
+from i18n.ui_helpers import (
+    combo_label_for_lang,
+    lang_combo_labels,
+    lang_from_combo_label,
+    msg_askyesno,
+    msg_info,
+)
 from schedule_folder import (
     FOLDER_BULK_ADVANCE_BATCH_PAUSE_SEC,
     FOLDER_BULK_ADVANCE_BATCH_SIZE,
@@ -44,16 +60,24 @@ from wa_ui.log_textbox_util import (
     bind_log_textbox_wheel,
     reload_log_textbox_from_memory,
 )
-from wa_ui.file_picker_util import pick_txt_or_folder, txt_open_initial_dir
+from wa_ui.file_picker_util import (
+    pick_image_files,
+    pick_txt_or_folder,
+    release_modal_grabs,
+    txt_open_initial_dir,
+)
+from wa_ui.modal_util import (
+    ask_yes_no,
+    pick_button_option,
+    prompt_text_with_skip,
+    run_after_modal_closed,
+    show_message,
+)
 from wa_ui.scroll_util import (
-    ADDRESS_LIST_HEIGHT,
     bind_scroll_tree_once,
-    mount_bounded_list_scroll,
     mount_page_scroll,
     scroll_wheel,
 )
-
-TASKMGR_TICK_MS = 5000
 
 import os
 import queue
@@ -65,8 +89,8 @@ import uuid
 import webbrowser
 from collections import Counter
 import tkinter as tk
-from tkinter import TclError, filedialog, messagebox
-from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
+from tkinter import TclError
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, TYPE_CHECKING
 
 import customtkinter as ctk
 
@@ -86,8 +110,9 @@ from ..compat_config import (
 )
 from ..listener import ListenerController
 from ..paths import app_root, resource_path
-from ..logger_util import add_memory_listener, error, get_recent_lines, info, remove_memory_listener
-from ..notifier import AlertPopup, show_stage_reminder
+from ..ui.log_view_filter import filter_lines_for_log_view, is_visible_in_log_view
+from ..logger_util import add_memory_listener, error, error_i18n, get_recent_lines, info, info_i18n, remove_memory_listener, warning_i18n
+from ..notifier import AlertPopup
 from ..scheduler import (
     LISTEN_HIT_PAUSE_REASON,
     DocMessage,
@@ -175,7 +200,7 @@ class MainWindow(ctk.CTkFrame):
         if not embedded:
             root = master if isinstance(master, ctk.CTk) else master.winfo_toplevel()
             try:
-                root.title("超群小帮手")
+                root.title(t("app.brand"))
                 root.geometry(MAIN_WINDOW_GEOMETRY)
                 root.resizable(False, False)
             except Exception:
@@ -193,7 +218,7 @@ class MainWindow(ctk.CTkFrame):
         self._content.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             self._content,
-            text="正在加载界面，请稍候…",
+            text=t("common.loading_ui"),
             font=ctk.CTkFont(size=16),
             text_color=COLORS["muted"],
         ).grid(row=0, column=0)
@@ -223,7 +248,7 @@ class MainWindow(ctk.CTkFrame):
             self._page_build_queue: List[NavId] = ["dash", "acct", "grp", "rules", "sched", "taskmgr", "logs"]
             self._page_build_tick()
         except Exception as exc:
-            error(f"主界面加载失败：{exc}")
+            error_i18n("log.ui_load_fail", err=exc)
 
     def _page_build_tick(self) -> None:
         if self._pages_ready:
@@ -235,8 +260,7 @@ class MainWindow(ctk.CTkFrame):
                 self._pages_ready = True
                 self._show_nav("dash")
                 self.after(80, self._raise_main_window)
-                self.after(5000, self._tick_schedule_job_lists)
-                info("主界面已就绪")
+                info_i18n("log.ui_ready")
                 return
             nav_id = self._page_build_queue.pop(0)
             builders = {
@@ -251,11 +275,11 @@ class MainWindow(ctk.CTkFrame):
             try:
                 self._nav[nav_id] = builders[nav_id]()
             except Exception as exc:
-                error(f"主界面加载失败（{nav_id}）：{exc}")
+                error_i18n("log.ui_page_fail", nav_id=nav_id, err=exc)
                 fail = ctk.CTkFrame(self._content, fg_color="transparent")
                 ctk.CTkLabel(
                     fail,
-                    text=f"页面加载失败（{nav_id}）\n{exc}\n请查看日志中心或 logs/app.log",
+                    text=t("log.ui_page_load_fail", nav_id=nav_id, err=exc),
                     text_color=COLORS["danger"],
                     wraplength=480,
                     justify="left",
@@ -267,7 +291,7 @@ class MainWindow(ctk.CTkFrame):
                 pass
             self.after(1, self._page_build_tick)
         except Exception as exc:
-            error(f"主界面加载失败：{exc}")
+            error_i18n("log.ui_load_fail", err=exc)
             self._show_ui_bootstrap_error(str(exc))
 
     def shutdown_ui(self) -> None:
@@ -292,7 +316,7 @@ class MainWindow(ctk.CTkFrame):
 
     def _warn_if_tg_session_down(self) -> None:
         if self._coord is not None and not self._coord.is_running():
-            warning("任务状态已更新，但 Telegram 统一会话未在运行，请点侧栏「保存并重载服务」。")
+            warning_i18n("log.coord_not_running")
 
     def _show_ui_bootstrap_error(self, msg: str) -> None:
         """界面分步构建失败时，在右侧显示错误而不是留黑屏。"""
@@ -301,7 +325,7 @@ class MainWindow(ctk.CTkFrame):
                 ch.destroy()
             ctk.CTkLabel(
                 self._content,
-                text=f"界面加载失败\n{msg}\n\n请重启程序；若仍失败请查看 logs/app.log",
+                text=t("log.ui_bootstrap_body", msg=msg),
                 font=ctk.CTkFont(size=14),
                 text_color=COLORS["danger"],
                 wraplength=520,
@@ -405,84 +429,155 @@ class MainWindow(ctk.CTkFrame):
 
     def bind_coordinator(self, coord: TelethonCoordinator) -> None:
         self._coord = coord
+        bind_warning = getattr(coord, "set_address_warning_callback", None)
+        if callable(bind_warning):
+            bind_warning(self._show_address_group_warning)
+
+    def _show_address_group_warning(self, label: str, kind: str, peer_id: int) -> None:
+        def run() -> None:
+            from i18n.ui_helpers import msg_warning
+
+            type_key = (
+                "grp.type_basic_group"
+                if kind == "basic_group"
+                else "grp.type_channel"
+            )
+            msg_warning(
+                self,
+                "grp.upgrade_supergroup_title",
+                "grp.upgrade_supergroup_body",
+                name=label,
+                type=t(type_key),
+                peer_id=peer_id,
+            )
+
+        self.after(0, run)
 
     def _doc_schedule_reminder(
-        self, job: ScheduledJob, item: DocMessage, step_one_based: int, paused_count: int = 0
+        self,
+        job: ScheduledJob,
+        item: DocMessage,
+        step_one_based: int,
+        paused_count: int = 0,
+        affected_job_ids: Optional[List[str]] = None,
     ) -> None:
-        grp = format_job_targets_label(load_config(), job)
+        """阶段提醒：runner 已暂停，patch 任务卡片；可选置顶弹窗。"""
+        ids = list(dict.fromkeys(affected_job_ids or []))
+        overrides: Dict[str, ScheduledJob] = {job.id: job}
+        if job.id not in ids:
+            ids.append(job.id)
+        note = (getattr(item, "reminder_note", "") or "").strip()
 
-        def show() -> None:
+        def run() -> None:
+            if ids:
+                self._patch_taskmgr_cards(ids, reorder=True, job_overrides=overrides)
+            if not getattr(self._cfg, "stage_reminder_popup_enabled", True):
+                return
             try:
-                body = item.reminder_note.strip() if item.reminder_note else "请关注当前任务进度。"
+                from tg_multi_listener.notifier import show_stage_reminder
+                from i18n.pause_reason import CODE_JOIN_GROUP_FAILED, pause_reason_is
+
+                cfg = load_config()
+                grp = format_job_targets_label(cfg, job)
+                is_join = pause_reason_is(job.pause_reason or "", CODE_JOIN_GROUP_FAILED)
+                if is_join:
+                    acc = (getattr(item, "original_account_id", None) or getattr(item, "account_id", None) or "").strip()
+                    subtitle = t("join.subtitle", name=job.source_name, account=acc or "—")
+                    if grp:
+                        subtitle += t("join.subtitle_group", grp=grp)
+                    title = t("join.title_tg")
+                else:
+                    subtitle = t("stage.subtitle", step=step_one_based, name=job.source_name)
+                    if grp:
+                        subtitle += t("stage.subtitle_group", grp=grp)
+                    title = t("stage.title_tg")
+                body = note or t("stage.no_note")
                 if paused_count > 0:
-                    body += f"\n\n已自动暂停 {paused_count} 个相关定时任务，请在「任务管理」页点卡片或「一键开始全部任务」。"
+                    body += t("stage.paused_related", n=paused_count)
                 show_stage_reminder(
                     self,
-                    title="定时任务 · 阶段提醒",
-                    subtitle=f"群：{grp} · 任务「{job.source_name}」· 第 {step_one_based} 步",
+                    title=title,
+                    subtitle=subtitle,
                     body=body,
                 )
-            except Exception:
-                pass
-            self._render_taskmgr_cards()
+            except Exception as exc:
+                error_i18n("log.stage_popup_fail", err=exc)
 
-        self.after(0, show)
+        self.after(0, run)
 
     def alert_callback(self, payload: Dict) -> None:
-        """由 Telethon 后台线程调用：必须经 after 投递到 Tk 主线程，否则暂停/刷新可能不生效。"""
+        """由 Telethon 后台线程调用：暂停须立即落盘，UI 刷新仍走主线程。"""
         p = dict(payload)
-
-        def run_on_main() -> None:
-            try:
-                record_alert()
-                chat_id = int(p.get("chat_id"))
-                raw = p.get("chat_id_raw")
-                raw_i = int(raw) if raw is not None else None
-                ev_u = str(p.get("chat_username") or "").strip() or None
-                ev_t = str(p.get("chat_title") or "").strip() or None
-                chat_disp = format_listener_chat_label(
-                    load_config(),
-                    peer_id=chat_id,
-                    chat_title=ev_t or "",
-                    chat_id_raw=raw_i,
-                    chat_username=ev_u,
-                )
-                paused = self._scheduler.pause_jobs_by_chat(
+        touched_ids: List[str] = []
+        try:
+            chat_id = int(p.get("chat_id"))
+            raw = p.get("chat_id_raw")
+            raw_i = int(raw) if raw is not None else None
+            ev_u = str(p.get("chat_username") or "").strip() or None
+            ev_t = str(p.get("chat_title") or "").strip() or None
+            touched_ids.extend(
+                self._scheduler.pause_jobs_by_chat(
                     chat_id,
                     LISTEN_HIT_PAUSE_REASON,
                     raw_chat_id=raw_i,
                     event_username=ev_u,
                     event_title=ev_t,
                 )
-                if paused == 0 and raw_i is not None and raw_i != chat_id:
-                    paused += self._scheduler.pause_jobs_by_chat(
+            )
+            if raw_i is not None and raw_i != chat_id:
+                touched_ids.extend(
+                    self._scheduler.pause_jobs_by_chat(
                         raw_i,
                         LISTEN_HIT_PAUSE_REASON,
                         raw_chat_id=chat_id,
                         event_username=ev_u,
                         event_title=ev_t,
                     )
-                if paused > 0:
-                    info(f"群 {chat_disp} 触发监听提醒：已自动暂停 {paused} 个文档任务，等待手动继续")
-                    self._render_taskmgr_cards()
+                )
+            touched_ids = list(dict.fromkeys(touched_ids))
+        except Exception as exc:
+            error_i18n("log.listen_hit_pause_fail", err=exc)
+
+        def run_on_main() -> None:
+            try:
+                record_alert()
+                chat_disp = ""
+                try:
+                    chat_id = int(p.get("chat_id"))
+                    raw = p.get("chat_id_raw")
+                    raw_i = int(raw) if raw is not None else None
+                    ev_u = str(p.get("chat_username") or "").strip() or None
+                    ev_t = str(p.get("chat_title") or "").strip() or None
+                    chat_disp = format_listener_chat_label(
+                        load_config(),
+                        peer_id=chat_id,
+                        chat_title=ev_t or "",
+                        chat_id_raw=raw_i,
+                        chat_username=ev_u,
+                    )
+                except Exception:
+                    chat_disp = str(p.get("chat_title", ""))
+                if touched_ids:
+                    info_i18n("log.listen_hit_chat", chat=chat_disp, n=len(touched_ids))
+                    self._patch_taskmgr_cards(touched_ids, reorder=True)
             except Exception as exc:
-                error(f"监听命中后暂停定时任务失败：{exc}")
+                error_i18n("log.listen_hit_ui_fail", err=exc)
             try:
                 AlertPopup(
                     self,
                     chat_title=str(p.get("chat_title", "")),
-                    chat_meta=chat_disp,
+                    chat_meta=chat_disp if chat_disp else str(p.get("chat_title", "")),
                     sender_name=str(p.get("sender_name", "")),
                     message_text=str(p.get("message_text", "")),
                     chat_username=p.get("chat_username"),
                 )
             except Exception as exc:
-                error(f"显示监听弹窗失败：{exc}")
+                error_i18n("log.listen_hit_popup_fail", err=exc)
 
         try:
             self.after(0, run_on_main)
         except Exception as exc:
-            error(f"投递监听提醒到主线程失败：{exc}")
+            error_i18n("log.listen_hit_dispatch_fail", err=exc)
 
     def _on_exit(self) -> None:
         # 不在此线程 join Telethon（会卡窗体数秒）；释放 UI 后由 main() 的 finally 统一 stop。
@@ -492,10 +587,15 @@ class MainWindow(ctk.CTkFrame):
         self.destroy()
 
     def _on_log_line(self, line: str) -> None:
+        if not is_visible_in_log_view(line):
+            return
         try:
             self._log_ui_queue.put_nowait(line)
         except Exception:
             pass
+
+    def _tg_log_lines(self, limit: int) -> List[str]:
+        return filter_lines_for_log_view(get_recent_lines(limit))
 
     def _drain_log_queue_to_textbox(self) -> None:
         lb = getattr(self, "_log_box", None)
@@ -530,10 +630,7 @@ class MainWindow(ctk.CTkFrame):
         """停止并重新启动监听/定时后台线程。可能阻塞数十秒（内部 join），勿在主 UI 线程直接调用。"""
         if self._coord is not None:
             if not self._coord.stop(join_timeout=DEFAULT_JOIN_TIMEOUT):
-                error(
-                    "重载已中止：Telegram 会话线程未在时限内退出。"
-                    "请先暂停全部定时任务，等待约半分钟后再试，或完全退出程序后重开。"
-                )
+                error_i18n("log.reload_abort")
                 return False
         else:
             self._listener.stop()
@@ -549,7 +646,7 @@ class MainWindow(ctk.CTkFrame):
     def _invoke_restart_in_background(self, on_main_thread: Optional[Callable[[], None]] = None) -> None:
         """在后台线程执行重载，避免主界面在 join Telethon 线程时卡死。"""
         if self._service_reload_busy:
-            info("重载服务进行中，请稍候再试")
+            info_i18n("log.reload_busy")
             return
         self._service_reload_busy = True
 
@@ -558,12 +655,12 @@ class MainWindow(ctk.CTkFrame):
             try:
                 ok = self._restart_services()
             except Exception as exc:
-                error(f"重载服务失败：{exc}")
+                error_i18n("log.reload_fail", err=exc)
             finally:
                 def done() -> None:
                     self._service_reload_busy = False
                     if not ok:
-                        info("服务重载未完成，请查看日志并按提示操作。")
+                        info_i18n("log.reload_incomplete")
                     if on_main_thread is not None and ok:
                         try:
                             on_main_thread()
@@ -580,23 +677,23 @@ class MainWindow(ctk.CTkFrame):
 
         logo = ctk.CTkLabel(
             side,
-            text="TG Listener",
+            text=t("tg.brand"),
             font=ctk.CTkFont(size=18, weight="bold"),
             text_color=COLORS["text"],
         )
         logo.pack(anchor="w", padx=18, pady=(24, 8))
 
-        sub = ctk.CTkLabel(side, text="监听 · 提醒 · 登录一体化", font=ctk.CTkFont(size=12), text_color=COLORS["muted"])
+        sub = ctk.CTkLabel(side, text=t("tg.subtitle"), font=ctk.CTkFont(size=12), text_color=COLORS["muted"])
         sub.pack(anchor="w", padx=18, pady=(0, 20))
 
         for nav_id, label in (
-            ("dash", "仪表盘"),
-            ("acct", "账号管理"),
-            ("grp", "通讯录"),
-            ("rules", "监听规则"),
-            ("sched", "定时任务"),
-            ("taskmgr", "任务管理"),
-            ("logs", "日志中心"),
+            ("dash", t("nav.dash")),
+            ("acct", t("nav.acct")),
+            ("grp", t("nav.grp")),
+            ("rules", t("nav.rules")),
+            ("sched", t("nav.sched")),
+            ("taskmgr", t("nav.taskmgr")),
+            ("logs", t("nav.logs_tg")),
         ):
             b = ctk.CTkButton(
                 side,
@@ -612,7 +709,7 @@ class MainWindow(ctk.CTkFrame):
 
         save_btn = ctk.CTkButton(
             side,
-            text="保存并重载服务",
+            text=t("common.save_reload_service"),
             fg_color=COLORS["accent"],
             hover_color="#3d7ae6",
             command=self._save_all_and_restart,
@@ -632,38 +729,24 @@ class MainWindow(ctk.CTkFrame):
         finish()
         return wrap
 
-    def _tick_schedule_job_lists(self) -> None:
-        """任务管理页可见时增量刷新任务卡片（不整页重建，避免闪烁）。"""
-        if not getattr(self, "_log_ui_pump_on", True):
-            return
-        try:
-            if self.winfo_exists() and self._pages_ready:
-                fr = self._nav.get("taskmgr")
-                if fr is not None and fr.winfo_ismapped():
-                    self._render_taskmgr_cards(force=False)
-        except Exception:
-            pass
-        if self._log_ui_pump_on:
-            try:
-                if self.winfo_exists():
-                    self.after(TASKMGR_TICK_MS, self._tick_schedule_job_lists)
-            except Exception:
-                pass
-
     def _format_send_progress(self, total: int, done: int, remain: int, *, step_total: int = 0) -> str:
         if total <= 0:
-            return "无发送条目"
+            return t("send_progress.none")
         if remain <= 0:
-            base = f"已发 {done} 条，已全部发完"
+            base = t("send_progress.all_done", done=done)
         else:
-            base = f"已发 {done} 条，还剩 {remain} 条"
+            base = t("send_progress.remain", done=done, remain=remain)
         if step_total > total:
-            return f"{base}（文档 {step_total} 步，含 {step_total - total} 个提醒）"
+            return t("send_progress.with_reminders", base=base, steps=step_total, reminders=step_total - total)
         return base
 
     def _show_nav(self, nav_id: NavId) -> None:
         if not self._pages_ready or not self._nav:
             return
+        try:
+            release_modal_grabs(self)
+        except Exception:
+            pass
         self._current_nav = nav_id
         for k, fr in self._nav.items():
             if k == nav_id:
@@ -679,10 +762,17 @@ class MainWindow(ctk.CTkFrame):
         elif nav_id == "grp":
             self._refresh_owner_account_combos()
             self._patch_group_rows()
+            foot = getattr(self, "_grp_foot", None)
+            if foot is not None:
+                try:
+                    foot.lift()
+                    foot.grid(row=2, column=0, sticky="ew")
+                except Exception:
+                    pass
         elif nav_id == "sched":
             self._refresh_schedule_targets_if_dirty()
         elif nav_id == "taskmgr":
-            self._render_taskmgr_cards()
+            self._sync_taskmgr_page()
         elif nav_id == "logs":
             self._flush_logs_ui()
 
@@ -698,7 +788,7 @@ class MainWindow(ctk.CTkFrame):
             while not self._listener.is_running() and time.time() < deadline:
                 time.sleep(0.05)
             if not self._listener.is_running():
-                info("统一会话尚未就绪，跳过本次登录预检测（避免与后台连接争用 session 文件）")
+                info_i18n("log.session_probe_skip")
 
                 def apply_skip() -> None:
                     if gen != self._login_probe_gen:
@@ -742,25 +832,25 @@ class MainWindow(ctk.CTkFrame):
 
     def _page_dashboard(self) -> ctk.CTkFrame:
         page = ctk.CTkFrame(self._content, fg_color="transparent")
-        wrap = self._wrap_page(page, "仪表盘")
+        wrap = self._wrap_page(page, t("nav.dash"))
 
         c1 = self._card(wrap, 1)
         c1.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(c1, text="今日提醒次数", font=ctk.CTkFont(size=13, weight="bold"), text_color=COLORS["text"]).grid(
+        ctk.CTkLabel(c1, text=t("dash.today_alerts"), font=ctk.CTkFont(size=13, weight="bold"), text_color=COLORS["text"]).grid(
             row=0, column=0, sticky="w", padx=16, pady=(12, 4)
         )
         self._dash_today = ctk.CTkLabel(c1, text="", font=ctk.CTkFont(size=14), text_color=COLORS["text"])
         self._dash_today.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 12))
 
         c2 = self._card(wrap, 2)
-        ctk.CTkLabel(c2, text="监听状态", font=ctk.CTkFont(size=13, weight="bold"), text_color=COLORS["text"]).grid(
+        ctk.CTkLabel(c2, text=t("dash.listen_status"), font=ctk.CTkFont(size=13, weight="bold"), text_color=COLORS["text"]).grid(
             row=0, column=0, sticky="w", padx=16, pady=(12, 4)
         )
         self._dash_listen = ctk.CTkLabel(c2, text="", font=ctk.CTkFont(size=14), text_color=COLORS["muted"], justify="left")
         self._dash_listen.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 12))
 
         c3 = self._card(wrap, 3)
-        ctk.CTkLabel(c3, text="账号摘要", font=ctk.CTkFont(size=13, weight="bold"), text_color=COLORS["text"]).grid(
+        ctk.CTkLabel(c3, text=t("dash.account_summary"), font=ctk.CTkFont(size=13, weight="bold"), text_color=COLORS["text"]).grid(
             row=0, column=0, sticky="w", padx=16, pady=(12, 4)
         )
         self._dash_acct = ctk.CTkLabel(
@@ -779,30 +869,30 @@ class MainWindow(ctk.CTkFrame):
 
     def _refresh_dashboard(self) -> None:
         n = today_alert_count()
-        self._dash_today.configure(text=f"今日已提醒 {n} 次")
+        self._dash_today.configure(text=t("dash.today_count", n=n))
         listen_on = bool(self._cfg.listening_enabled)
         conn = self._listener.is_running()
         parts = [
-            f"监听总开关：{'开' if listen_on else '关'}",
-            f"Telegram 连接：{'已连接' if conn else '未连接'}",
+            t("dash.listen_on") if listen_on else t("dash.listen_off"),
+            t("dash.tg_connected") if conn else t("dash.tg_disconnected"),
         ]
         if listen_on and conn:
-            parts.append("（正在监听配置中的群与用户）")
+            parts.append(t("dash.listening_active"))
         elif listen_on and not conn:
-            parts.append("（总开关已开但未连上，可检查网络与账号登录）")
+            parts.append(t("dash.listen_on_disconnected_tg"))
         self._dash_listen.configure(text="  ·  ".join(parts))
         lines = []
         for a in self._cfg.accounts:
             st = self._login_status.get(a.id)
             if st is True:
-                st_txt = "已登录"
+                st_txt = t("dash.tg_logged_in")
             elif st is False:
-                st_txt = "未登录"
+                st_txt = t("dash.tg_not_logged_in")
             else:
-                st_txt = "登录状态检测中…"
-            extra = f"，文件:{a.session_name}" if a.session_name != a.id else ""
-            lines.append(f"{a.id} · {st_txt} · {'启用' if a.enabled else '停用'}{extra}")
-        self._dash_acct.configure(text="\n".join(lines) if lines else "（未配置账号）")
+                st_txt = t("dash.tg_checking")
+            extra = t("dash.tg_session_file", name=a.session_name) if a.session_name != a.id else ""
+            lines.append(t("dash.account_line", id=a.id, status=st_txt, enabled=t("dash.enabled") if a.enabled else t("dash.disabled")) + extra)
+        self._dash_acct.configure(text="\n".join(lines) if lines else t("dash.no_accounts_configured"))
 
     # --- accounts ---
     def _page_accounts(self) -> ctk.CTkFrame:
@@ -813,19 +903,19 @@ class MainWindow(ctk.CTkFrame):
         af.pack(fill="x", padx=12, pady=10)
         ctk.CTkButton(
             af,
-            text="打开 my.telegram.org（查看 / 创建应用）",
+            text=t("acct.tg.open_api_site"),
             fg_color=COLORS["border"],
             command=lambda: webbrowser.open("https://my.telegram.org/apps"),
         ).pack(fill="x", pady=(0, 6))
-        ctk.CTkButton(af, text="仅保存到列表", fg_color=COLORS["border"], command=self._add_account_row_ui).pack(fill="x", pady=(0, 6))
-        ctk.CTkButton(af, text="登录此账号", fg_color=COLORS["accent"], hover_color="#3d7ae6", command=self._login_from_form).pack(fill="x")
+        ctk.CTkButton(af, text=t("acct.tg.save_list_only"), fg_color=COLORS["border"], command=self._add_account_row_ui).pack(fill="x", pady=(0, 6))
+        ctk.CTkButton(af, text=t("acct.tg.login_this"), fg_color=COLORS["accent"], hover_color="#3d7ae6", command=self._login_from_form).pack(fill="x")
 
         wrap, finish_scroll = self._mount_main_scroll(page, footer=acct_foot)
 
-        ctk.CTkLabel(wrap, text="账号管理", font=ctk.CTkFont(size=22, weight="bold"), text_color=COLORS["text"]).pack(anchor="w", pady=(8, 4))
+        ctk.CTkLabel(wrap, text=t("acct.title"), font=ctk.CTkFont(size=22, weight="bold"), text_color=COLORS["text"]).pack(anchor="w", pady=(8, 4))
         intro_acct = ctk.CTkLabel(
             wrap,
-            text="Telegram 规定每个「应用」有一套 API；您所有账号共用这一套即可。下面重点是：给每个号起名 → 登录（弹窗里依次输入手机号、验证码，如有则二步验证密码）。",
+            text=t("acct.tg.intro"),
             text_color=COLORS["muted"],
             wraplength=520,
             justify="left",
@@ -834,12 +924,12 @@ class MainWindow(ctk.CTkFrame):
 
         api_card = ctk.CTkFrame(wrap, fg_color=COLORS["card"], corner_radius=12, border_width=1, border_color=COLORS["border"])
         api_card.pack(fill="x", pady=(0, 10))
-        ctk.CTkLabel(api_card, text="共用接口（全局只填一次）", font=ctk.CTkFont(size=14, weight="bold"), text_color=COLORS["text"]).pack(
+        ctk.CTkLabel(api_card, text=t("acct.tg.api_global_title"), font=ctk.CTkFont(size=14, weight="bold"), text_color=COLORS["text"]).pack(
             anchor="w", padx=14, pady=(12, 6)
         )
         api_hint = ctk.CTkLabel(
             api_card,
-            text="来自 my.telegram.org，与登录哪个 Telegram 账号无关；填好后侧栏「保存并重载」会写入配置文件。",
+            text=t("acct.tg.api_global_hint"),
             text_color=COLORS["muted"],
             wraplength=520,
             justify="left",
@@ -849,8 +939,8 @@ class MainWindow(ctk.CTkFrame):
         api_form = ctk.CTkFrame(api_card, fg_color="transparent")
         api_form.pack(fill="x", padx=14, pady=(0, 12))
         api_form.grid_columnconfigure(0, weight=1)
-        self._glob_api_id = ctk.CTkEntry(api_form, placeholder_text="API ID（数字）")
-        self._glob_api_hash = ctk.CTkEntry(api_form, placeholder_text="API Hash（长字符串）")
+        self._glob_api_id = ctk.CTkEntry(api_form, placeholder_text=t("acct.tg.api_id_ph"))
+        self._glob_api_hash = ctk.CTkEntry(api_form, placeholder_text=t("acct.tg.api_hash_ph"))
         self._glob_api_id.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         self._glob_api_hash.grid(row=1, column=0, sticky="ew", pady=(0, 4))
         if self._cfg.api_id:
@@ -860,12 +950,12 @@ class MainWindow(ctk.CTkFrame):
 
         login_card = ctk.CTkFrame(wrap, fg_color=COLORS["card"], corner_radius=12, border_width=1, border_color=COLORS["border"])
         login_card.pack(fill="x", pady=(0, 12))
-        ctk.CTkLabel(login_card, text="登录流程：添加或选中一个账号身份", font=ctk.CTkFont(size=14, weight="bold"), text_color=COLORS["text"]).pack(
+        ctk.CTkLabel(login_card, text=t("acct.tg.login_flow_title"), font=ctk.CTkFont(size=14, weight="bold"), text_color=COLORS["text"]).pack(
             anchor="w", padx=14, pady=(12, 6)
         )
         login_intro = ctk.CTkLabel(
             login_card,
-            text="① 起一个账号简称（英文/数字）② 点「登录此账号」→ 弹窗里依次输入手机号 → 验证码 →（如有）二步验证密码。登录文件会自动保存为 sessions/简称.session，无需再填文件名。",
+            text=t("acct.tg.login_flow_hint"),
             text_color=COLORS["muted"],
             wraplength=520,
             justify="left",
@@ -875,12 +965,12 @@ class MainWindow(ctk.CTkFrame):
         form = ctk.CTkFrame(login_card, fg_color="transparent")
         form.pack(fill="x", padx=14, pady=(0, 14))
         form.grid_columnconfigure(0, weight=1)
-        self._acc_id = ctk.CTkEntry(form, placeholder_text="例如 work、a1（同时作为登录文件名）")
-        self._acc_phone = ctk.CTkEntry(form, placeholder_text="备注手机号（可选）")
+        self._acc_id = ctk.CTkEntry(form, placeholder_text=t("acct.id_ph"))
+        self._acc_phone = ctk.CTkEntry(form, placeholder_text=t("acct.phone_ph"))
 
         rows = (
-            ("账号简称", self._acc_id, "定时任务与 TXT 里的「账号」填这个名；磁盘上对应 sessions/该名.session"),
-            ("备注", self._acc_phone, "仅备忘，不参与登录"),
+            ("acct.tg.id_label", self._acc_id, t("acct.tg.id_hint")),
+            ("acct.tg.remark_label", self._acc_phone, t("acct.tg.remark_hint")),
         )
         r = 0
         form_hints: List[ctk.CTkLabel] = []
@@ -894,7 +984,7 @@ class MainWindow(ctk.CTkFrame):
 
         self._elastic_wraplabels(wrap, [intro_acct, api_hint, login_intro, *form_hints])
 
-        self._acc_rows_title = ctk.CTkLabel(wrap, text="已保存的账号（勾选参与监听；未登录时点「登录」）", font=ctk.CTkFont(size=14, weight="bold"), text_color=COLORS["text"])
+        self._acc_rows_title = ctk.CTkLabel(wrap, text=t("acct.tg.saved_rows_title"), font=ctk.CTkFont(size=14, weight="bold"), text_color=COLORS["text"])
         self._acc_rows_title.pack(anchor="w", pady=(10, 8))
         self._acc_rows = ctk.CTkFrame(wrap, fg_color="transparent")
         self._acc_rows.pack(fill="both", expand=True)
@@ -906,10 +996,10 @@ class MainWindow(ctk.CTkFrame):
     def _account_login_style(self, account_id: str) -> tuple:
         st = self._login_status.get(account_id)
         if st is True:
-            return COLORS["success"], 2, "已登录", COLORS["success"]
+            return COLORS["success"], 2, t("acct.tg.logged_in"), COLORS["success"]
         if st is False:
-            return COLORS["danger"], 2, "未登录", COLORS["danger"]
-        return COLORS["border"], 1, "检测中…", COLORS["muted"]
+            return COLORS["danger"], 2, t("acct.not_logged_in"), COLORS["danger"]
+        return COLORS["border"], 1, t("acct.tg.checking"), COLORS["muted"]
 
     def _apply_account_tile(self, w: Dict[str, Any], a: Account) -> None:
         bcol, bw, badge, bfg = self._account_login_style(a.id)
@@ -955,7 +1045,7 @@ class MainWindow(ctk.CTkFrame):
         badge_lbl.pack(anchor="w", pady=(0, 8))
         ctk.CTkButton(
             inner,
-            text="登录",
+            text=t("acct.login"),
             height=28,
             fg_color=COLORS["accent"],
             hover_color="#3d7ae6",
@@ -963,7 +1053,7 @@ class MainWindow(ctk.CTkFrame):
         ).pack(fill="x", pady=(0, 4))
         ctk.CTkButton(
             inner,
-            text="删除",
+            text=t("common.delete"),
             height=26,
             fg_color=COLORS["border"],
             command=lambda idx=acc_index: self._del_account(idx),
@@ -1038,7 +1128,7 @@ class MainWindow(ctk.CTkFrame):
 
     def _parse_account_form(self) -> Optional[Account]:
         if not self._merge_global_api_from_ui_into_cfg():
-            info("请先在上方填写共用的 API ID 与 API Hash（所有账号共用这一套）。")
+            info_i18n("log.tg_api_required")
             return None
         aid = self._acc_id.get().strip() or "default"
         phone = self._acc_phone.get().strip()
@@ -1050,7 +1140,7 @@ class MainWindow(ctk.CTkFrame):
         except IndexError:
             return
         if not self._merge_global_api_from_ui_into_cfg():
-            info("请先在页面顶部填写共用的 API ID 与 API Hash。")
+            info_i18n("log.tg_api_required_short")
             return
         save_config(self._cfg)
         self._begin_login(acc)
@@ -1073,7 +1163,7 @@ class MainWindow(ctk.CTkFrame):
 
     def _stop_backend_for_exclusive_login(self) -> None:
         """在登录专用线程内调用：必须等统一会话彻底释放 .session，否则会 sqlite/database locked 卡死。"""
-        info("正在停止监听与定时任务并等待会话释放，用于安全登录…")
+        info_i18n("log.tg_login_prepare")
         if self._coord is not None:
             if not self._coord.stop(join_timeout=DEFAULT_JOIN_TIMEOUT):
                 raise RuntimeError(
@@ -1085,10 +1175,10 @@ class MainWindow(ctk.CTkFrame):
 
     def _begin_login(self, acc: Account) -> None:
         if not self._merge_global_api_from_ui_into_cfg():
-            info("请先在页面顶部填写共用的 API ID 与 API Hash。")
+            info_i18n("log.tg_api_required_short")
             return
         save_config(self._cfg)
-        info(f"正在为账号「{acc.id}」登录…（将短暂停止监听与定时任务；请按弹窗依次完成手机号 / 验证码 / 二步验证）")
+        info_i18n("log.tg_login_start", id=acc.id)
 
         login_id = acc.id
 
@@ -1103,10 +1193,11 @@ class MainWindow(ctk.CTkFrame):
                 self._refresh_owner_account_combos()
                 self._refresh_schedule_combo()
                 self._refresh_schedule_target_checks()
-                self._render_taskmgr_cards()
+                self._sync_taskmgr_page()
+                self._sync_sched_job_pick_combo()
                 self._refresh_dashboard()
                 self._schedule_login_probe()
-                info("服务已根据配置重启")
+                info_i18n("log.tg_services_restarted")
 
             self._invoke_restart_in_background(after_restart)
 
@@ -1137,7 +1228,7 @@ class MainWindow(ctk.CTkFrame):
             self._coord.apply_config_hot(self._cfg)
         else:
             self._scheduler.start(self._cfg)
-        info(f"已保存账号「{acc.id}」；可勾选启用后点「登录」，或「保存并重载服务」。")
+        info_i18n("log.tg_account_saved", id=acc.id)
 
     def _refresh_schedule_combo(self) -> None:
         if getattr(self, "_jacc", None) is None:
@@ -1159,7 +1250,7 @@ class MainWindow(ctk.CTkFrame):
         self._render_account_rows()
         self._refresh_owner_account_combos()
         self._refresh_schedule_combo()
-        info(f"已删除账号「{dead.id}」并已保存到配置。")
+        info_i18n("log.tg_account_deleted", dead=dead.id)
         if self._coord is not None and self._coord.has_connected_clients():
             def after_reload() -> None:
                 self._render_account_rows()
@@ -1174,15 +1265,16 @@ class MainWindow(ctk.CTkFrame):
         page = ctk.CTkFrame(self._content, fg_color="transparent")
         page.grid_columnconfigure(0, weight=1)
         page.grid_rowconfigure(1, weight=1)
+        page.grid_rowconfigure(2, weight=0)
 
         header = ctk.CTkFrame(page, fg_color="transparent")
         header.grid(row=0, column=0, sticky="ew")
-        ctk.CTkLabel(header, text="通讯录（群与用户）", font=ctk.CTkFont(size=22, weight="bold"), text_color=COLORS["text"]).pack(
+        ctk.CTkLabel(header, text=t("grp.header"), font=ctk.CTkFont(size=22, weight="bold"), text_color=COLORS["text"]).pack(
             anchor="w", pady=(8, 4)
         )
         ctk.CTkLabel(
             header,
-            text="底部填写后点「添加」；列表点「编辑」改详情、↑↓ 调序。群：-100… ID、@群名或 t.me；监听须填用户，仅定时可留空。生效请侧栏「保存并重载服务」。",
+            text=t("grp.tg_hint"),
             text_color=COLORS["muted"],
             wraplength=680,
             justify="left",
@@ -1192,10 +1284,9 @@ class MainWindow(ctk.CTkFrame):
         list_host.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
         list_card = ctk.CTkFrame(list_host, fg_color=COLORS["card"], corner_radius=12, border_width=1, border_color=COLORS["border"])
         list_card.pack(fill="both", expand=True)
-        ctk.CTkLabel(list_card, text="通讯录列表", text_color=COLORS["muted"]).pack(anchor="w", padx=12, pady=(10, 4))
-        list_inner, list_canvas, finish_list, _list_shell = mount_bounded_list_scroll(
-            list_card, height=ADDRESS_LIST_HEIGHT, bg=COLORS["bg"]
-        )
+        ctk.CTkLabel(list_card, text=t("grp.list_title"), text_color=COLORS["muted"]).pack(anchor="w", padx=12, pady=(10, 4))
+        # 不用固定高度：小窗口下会把底栏顶出可视区
+        list_inner, list_canvas, finish_list = mount_page_scroll(list_card, bg=COLORS["bg"])
         self._grp_list_scroll_handler = lambda e, c=list_canvas: scroll_wheel(c, e)
         self._grp_rows = ctk.CTkFrame(list_inner, fg_color="transparent")
         self._grp_rows.pack(fill="x")
@@ -1205,6 +1296,7 @@ class MainWindow(ctk.CTkFrame):
 
         grp_foot = ctk.CTkFrame(page, fg_color=COLORS["card"], corner_radius=12, border_width=1, border_color=COLORS["border"])
         grp_foot.grid(row=2, column=0, sticky="ew")
+        self._grp_foot = grp_foot
         form = ctk.CTkFrame(grp_foot, fg_color="transparent")
         form.pack(fill="x", padx=10, pady=8)
 
@@ -1216,13 +1308,13 @@ class MainWindow(ctk.CTkFrame):
             ent.pack(side="left", fill="x", expand=True)
             return ent
 
-        self._addr_remark = _addr_field_row("备注", "显示名")
-        self._addr_chat = _addr_field_row("群", "ID / @群名 / t.me")
-        self._addr_user = _addr_field_row("用户", "ID 或 @用户名，可不填")
+        self._addr_remark = _addr_field_row(t("grp.remark"), t("grp.display_name_ph"))
+        self._addr_chat = _addr_field_row(t("grp.group"), t("grp.tg_chat_ph"))
+        self._addr_user = _addr_field_row(t("grp.user"), t("grp.tg_user_ph"))
 
         action = ctk.CTkFrame(form, fg_color="transparent")
         action.pack(fill="x", pady=(4, 0))
-        ctk.CTkLabel(action, text="归属", text_color=COLORS["muted"], width=52, anchor="w").pack(side="left", padx=(0, 6))
+        ctk.CTkLabel(action, text=t("grp.owner"), text_color=COLORS["muted"], width=52, anchor="w").pack(side="left", padx=(0, 6))
         acc_own = self._owner_account_values()
         self._addr_owner = ctk.CTkComboBox(action, width=88, height=28, values=acc_own or ["—"])
         self._addr_owner.pack(side="left", padx=(0, 8))
@@ -1233,7 +1325,7 @@ class MainWindow(ctk.CTkFrame):
         self._addr_listen = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(
             action,
-            text="监听",
+            text=t("grp.listen"),
             variable=self._addr_listen,
             text_color=COLORS["text"],
             width=56,
@@ -1242,7 +1334,7 @@ class MainWindow(ctk.CTkFrame):
         ).pack(side="left", padx=(0, 8))
         ctk.CTkButton(
             action,
-            text="添加",
+            text=t("common.add"),
             width=64,
             height=28,
             fg_color=COLORS["accent"],
@@ -1250,7 +1342,7 @@ class MainWindow(ctk.CTkFrame):
         ).pack(side="left", padx=(0, 6))
         ctk.CTkButton(
             action,
-            text="保存",
+            text=t("grp.save"),
             width=64,
             height=28,
             fg_color=COLORS["border"],
@@ -1265,21 +1357,21 @@ class MainWindow(ctk.CTkFrame):
         self._render_group_rows()
         self._mark_schedule_targets_dirty()
         if not resolve_online:
-            info("通讯录已保存到配置文件。")
+            info_i18n("log.address_saved_file")
             return
         if self._coord is not None and self._coord.has_connected_clients():
             self._coord.apply_config_hot(self._cfg)
         else:
-            info("通讯录已保存；账号在线后将自动解析群标识，或请点「保存并重载服务」。")
+            info_i18n("log.address_saved_offline")
 
     def _save_address_book(self) -> None:
         self._commit_address_book(resolve_online=True)
 
     def _group_row_summary(self, ent: AddressEntry) -> str:
-        listen_txt = "监听 ✓" if ent.listen_enabled else "仅定时"
+        listen_txt = t("grp.listen_ok") if ent.listen_enabled else t("grp.schedule_only")
         user_txt = ent.watch_user.strip() or "—"
-        owner_txt = (ent.owner_account_id or "").strip() or "未选择"
-        base = f"群 {ent.chat_ref}  ·  用户 {user_txt}  ·  主号→{owner_txt}  ·  {listen_txt}"
+        owner_txt = (ent.owner_account_id or "").strip() or t("grp.not_selected")
+        base = t("grp.row_summary", chat=ent.chat_ref, user=user_txt, owner=owner_txt, tag=listen_txt)
         extra, _ = self._watch_audit_display(ent)
         return base + extra
 
@@ -1287,13 +1379,13 @@ class MainWindow(ctk.CTkFrame):
         st = self._watch_audit_flags.get(ent.id, "")
         if st == WatchAuditStatus.ABSENT.value:
             return (
-                "  ·  ⚠ 用户不在群内，建议清空监听用户或删除条目",
+                t("audit.not_in_group_short"),
                 COLORS["danger"],
             )
         if st == WatchAuditStatus.ERROR.value:
-            return ("  ·  ⚠ 未能检测", COLORS["border"])
+            return (t("audit.check_fail_short"), COLORS["border"])
         if st == WatchAuditStatus.OFFLINE.value:
-            return ("  ·  ⚠ 归属账号未在线", COLORS["border"])
+            return (t("audit.offline_short"), COLORS["border"])
         return "", COLORS["border"]
 
     def _address_book_ids(self) -> List[str]:
@@ -1316,7 +1408,7 @@ class MainWindow(ctk.CTkFrame):
         title_txt = f"{i + 1}. {ent.remark.strip() or ent.id}"
         extra, border = self._watch_audit_display(ent)
         if self._watch_audit_flags.get(ent.id) == WatchAuditStatus.ABSENT.value:
-            title_txt += "  ⚠不在群"
+            title_txt += t("grp.not_in_group_badge")
         w["title"].configure(
             text=title_txt,
             text_color=COLORS["danger"] if extra else COLORS["text"],
@@ -1360,7 +1452,7 @@ class MainWindow(ctk.CTkFrame):
             if not self._grp_rows.winfo_children():
                 ctk.CTkLabel(
                     self._grp_rows,
-                    text="尚无通讯录条目，请在下方表单添加。",
+                    text=t("grp.empty"),
                     text_color=COLORS["muted"],
                 ).pack(anchor="w", padx=4, pady=8)
             return
@@ -1388,7 +1480,7 @@ class MainWindow(ctk.CTkFrame):
             head.pack(fill="x", padx=12, pady=(8, 0))
             title_txt = f"{i + 1}. {ent.remark.strip() or ent.id}"
             if self._watch_audit_flags.get(ent.id) == WatchAuditStatus.ABSENT.value:
-                title_txt += "  ⚠不在群"
+                title_txt += t("grp.not_in_group_badge")
             title_lb = ctk.CTkLabel(
                 head,
                 text=title_txt,
@@ -1422,7 +1514,7 @@ class MainWindow(ctk.CTkFrame):
             down_btn.pack(side="left", padx=(0, 4))
             ctk.CTkButton(
                 order_btns,
-                text="编辑",
+                text=t("grp.edit_btn"),
                 width=52,
                 height=26,
                 fg_color=COLORS["accent"],
@@ -1464,7 +1556,7 @@ class MainWindow(ctk.CTkFrame):
         save_config(self._cfg)
         self._patch_group_rows()
         self._mark_schedule_targets_dirty()
-        info(f"已更新通讯录：{updated.remark}")
+        info_i18n("log.address_updated_remark", remark=updated.remark)
         if self._coord is not None and self._coord.has_connected_clients():
             self._coord.apply_config_hot(self._cfg)
 
@@ -1492,39 +1584,39 @@ class MainWindow(ctk.CTkFrame):
         u = self._addr_user.get().strip()
         listen_on = bool(self._addr_listen.get())
         if not remark or not g:
-            info("请填写备注与群标识。")
+            info_i18n("addr_edit.save_required")
             return
         try:
             parse_chat_ref_input(g)
         except ValueError as exc:
-            info(str(exc) or "群或频道标识无效。")
+            info_i18n("addr_edit.chat_invalid")
             return
         if listen_on:
             if not u:
-                info("参与监听时，请填写要监听的用户（数字 ID 或 @用户名）。")
+                info_i18n("log.watch_user_required")
                 return
             try:
                 parse_watch_user_input(u)
             except ValueError:
-                info("监听用户无效：请填写数字 ID，或对方已设置的公开 @用户名。")
+                info_i18n("log.watch_user_invalid_tg")
                 return
         elif u:
             try:
                 parse_watch_user_input(u)
             except ValueError:
-                info("用户格式无效。")
+                info_i18n("addr_edit.user_invalid")
                 return
         acc_vals = self._owner_account_values()
         if not acc_vals:
-            info("请先在「账号管理」添加至少一个账号。")
+            info_i18n("log.need_account_first")
             return
         owner = ""
         if getattr(self, "_addr_owner", None) is not None:
             owner = self._addr_owner.get().strip()
-        if owner in ("", "—", "请选择"):
+        if owner in ("", "—", t("grp.please_select")):
             owner = acc_vals[0]
         if owner not in acc_vals:
-            info("请选择该群的归属账号。")
+            info_i18n("log.need_owner_account")
             return
         ent = AddressEntry(
             id=uuid.uuid4().hex[:12],
@@ -1543,9 +1635,9 @@ class MainWindow(ctk.CTkFrame):
             self._addr_owner.set(acc_vals[0])
         try:
             self._commit_address_book()
-            info(f"已添加通讯录：{remark}（归属→{owner}）")
+            info_i18n("log.address_added_owner", remark=remark, owner=owner)
         except Exception as exc:
-            error(f"添加通讯录失败：{exc}")
+            error_i18n("log.address_add_fail", err=exc)
             self._cfg.address_book = [e for e in self._cfg.address_book if e.id != ent.id]
 
     def _del_address_entry(self, entry_id: str) -> None:
@@ -1554,9 +1646,9 @@ class MainWindow(ctk.CTkFrame):
         self._sync_jobs_after_address_entry_removed(entry_id)
         self._commit_address_book()
         if removed is not None:
-            info(f"已删除通讯录：{removed.remark or removed.id}，并同步更新定时任务。")
+            info_i18n("log.address_removed", name=removed.remark or removed.id)
         else:
-            info("已删除该条目并保存到配置文件。")
+            info_i18n("log.address_removed_simple")
 
     def _sync_jobs_after_address_entry_removed(self, entry_id: str) -> None:
         """通讯录删群后，同步清理任务目标并移除空目标任务。"""
@@ -1584,9 +1676,9 @@ class MainWindow(ctk.CTkFrame):
             return
         save_jobs(kept)
         if removed > 0:
-            info(f"通讯录变更已同步：更新 {changed} 个任务，删除 {removed} 个空目标任务。")
+            info_i18n("log.address_sync_both", changed=changed, removed=removed)
         else:
-            info(f"通讯录变更已同步：更新 {changed} 个任务目标。")
+            info_i18n("log.address_sync_updated", changed=changed)
         if self._sched_edit_job_id and all(j.id != self._sched_edit_job_id for j in kept):
             self._sched_edit_job_id = None
         self._render_jobs(full=True)
@@ -1609,17 +1701,17 @@ class MainWindow(ctk.CTkFrame):
         self._sched_target_vars = []
         self._sched_target_rows = []
         if not self._cfg.address_book:
-            ctk.CTkLabel(self._sched_targets, text="请先在「通讯录」添加群。", text_color=COLORS["muted"]).pack(anchor="w", padx=4, pady=6)
+            ctk.CTkLabel(self._sched_targets, text=t("grp.no_groups_hint"), text_color=COLORS["muted"]).pack(anchor="w", padx=4, pady=6)
             return
         for ent in self._cfg.address_book:
             v = ctk.BooleanVar(value=False)
             self._sched_target_vars.append(v)
             self._sched_target_rows.append((ent, v))
             owner = (ent.owner_account_id or "").strip()
-            own_hint = f" · 主号→{owner}" if owner else ""
+            own_hint = t("grp.owner_hint", owner=owner) if owner else ""
             kind_hint = entry_schedule_kind_hint(jobs, ent.id)
             last_fn = (getattr(ent, "last_schedule_source_name", "") or "").strip()
-            last_hint = f" · 上次任务→{last_fn}" if last_fn else " · 上次任务→为空"
+            last_hint = t("grp.last_task", name=last_fn) if last_fn else t("grp.last_task_empty")
             disp = f"{ent.remark.strip() or ent.id}{own_hint}{kind_hint}   （{ent.chat_ref}{last_hint}）"
             ctk.CTkCheckBox(
                 self._sched_targets,
@@ -1632,21 +1724,48 @@ class MainWindow(ctk.CTkFrame):
     def _page_rules(self) -> ctk.CTkFrame:
         page = ctk.CTkFrame(self._content, fg_color="transparent")
         wrap, finish_scroll = self._mount_main_scroll(page)
-        ctk.CTkLabel(wrap, text="监听与限流", font=ctk.CTkFont(size=22, weight="bold"), text_color=COLORS["text"]).pack(anchor="w", pady=(8, 16))
+        ctk.CTkLabel(wrap, text=t("rules.title_tg"), font=ctk.CTkFont(size=22, weight="bold"), text_color=COLORS["text"]).pack(anchor="w", pady=(8, 16))
 
         box = ctk.CTkFrame(wrap, fg_color=COLORS["card"], corner_radius=12, border_width=1, border_color=COLORS["border"])
         box.pack(fill="x")
+        lang_row = ctk.CTkFrame(box, fg_color="transparent")
+        lang_row.pack(fill="x", padx=14, pady=(12, 4))
+        ctk.CTkLabel(lang_row, text=t("rules.lang_label"), text_color=COLORS["muted"]).pack(side="left")
+        self._lang_combo = ctk.CTkComboBox(
+            lang_row,
+            width=140,
+            values=list(lang_combo_labels()),
+            command=self._on_lang_combo_changed,
+        )
+        self._lang_combo.pack(side="left", padx=(8, 0))
+        self._lang_combo.set(combo_label_for_lang(get_lang()))
+        ctk.CTkLabel(
+            box,
+            text=t("rules.lang_hint"),
+            text_color=COLORS["muted"],
+            font=ctk.CTkFont(size=11),
+        ).pack(anchor="w", padx=14, pady=(0, 8))
         self._listen_var = ctk.BooleanVar(value=self._cfg.listening_enabled)
         ctk.CTkCheckBox(
             box,
-            text="启用消息监听（关闭后仍保留配置，但不连接 Telegram）",
+            text=t("rules.enable_listen_tg"),
             variable=self._listen_var,
             command=lambda: setattr(self._cfg, "listening_enabled", bool(self._listen_var.get())),
             text_color=COLORS["text"],
-        ).pack(anchor="w", padx=14, pady=12)
+        ).pack(anchor="w", padx=14, pady=(12, 4))
+        self._stage_popup_var = ctk.BooleanVar(value=getattr(self._cfg, "stage_reminder_popup_enabled", True))
+        ctk.CTkCheckBox(
+            box,
+            text=t("rules.stage_popup"),
+            variable=self._stage_popup_var,
+            command=lambda: setattr(
+                self._cfg, "stage_reminder_popup_enabled", bool(self._stage_popup_var.get())
+            ),
+            text_color=COLORS["text"],
+        ).pack(anchor="w", padx=14, pady=(0, 12))
 
-        ctk.CTkLabel(box, text="按群限流（秒）", text_color=COLORS["muted"]).pack(anchor="w", padx=14, pady=(4, 6))
-        self._rate_entry = ctk.CTkEntry(box, placeholder_text="秒")
+        ctk.CTkLabel(box, text=t("rules.rate_limit"), text_color=COLORS["muted"]).pack(anchor="w", padx=14, pady=(4, 6))
+        self._rate_entry = ctk.CTkEntry(box, placeholder_text=t("rules.rate_limit_ph"))
         self._rate_entry.insert(0, str(self._cfg.rate_limit_seconds))
         self._rate_entry.pack(fill="x", padx=14, pady=(0, 14))
 
@@ -1662,15 +1781,14 @@ class MainWindow(ctk.CTkFrame):
         sync_box.pack(fill="x", pady=(12, 0))
         ctk.CTkLabel(
             sync_box,
-            text="「上次任务→」在添加文档任务时自动更新；删除任务管理卡片不会改动。"
-            "需要与当前任务列表对齐时，点下方按钮手动同步（有任务写入文档名，无任务显示为空）。",
+            text=t("rules.sync_hint"),
             text_color=COLORS["muted"],
             wraplength=640,
             justify="left",
         ).pack(anchor="w", padx=14, pady=(12, 8))
         ctk.CTkButton(
             sync_box,
-            text="从任务管理同步上次任务",
+            text=t("rules.sync_btn"),
             fg_color=COLORS["accent"],
             hover_color="#3d7ae6",
             command=self._sync_last_schedule_from_jobs,
@@ -1680,14 +1798,14 @@ class MainWindow(ctk.CTkFrame):
         audit_box.pack(fill="x", pady=(12, 0))
         ctk.CTkLabel(
             audit_box,
-            text="检测所有「参与监听」的群：若监听用户已不在成员列表中，会在「通讯录」对应条目标红提示，便于清理。",
+            text=t("rules.audit_hint"),
             text_color=COLORS["muted"],
             wraplength=640,
             justify="left",
         ).pack(anchor="w", padx=14, pady=(12, 8))
         ctk.CTkButton(
             audit_box,
-            text="检测不在群内的监听用户",
+            text=t("rules.audit_btn"),
             fg_color=COLORS["accent"],
             hover_color="#3d7ae6",
             command=self._check_watch_memberships,
@@ -1695,17 +1813,22 @@ class MainWindow(ctk.CTkFrame):
         finish_scroll()
         return page
 
+    def _on_lang_combo_changed(self, choice: str) -> None:
+        lang = lang_from_combo_label(choice)
+        set_lang_for_next_launch(lang)
+        info_i18n("rules.lang_saved", lang=combo_label_for_lang(lang))
+
     def _check_watch_memberships(self) -> None:
         if not self._coord or not self._coord.has_connected_clients():
-            info("请先登录 Telegram 账号并点「保存并重载服务」后再检测。")
+            info_i18n("log.audit_need_login_tg")
             return
-        info("正在检测各群监听用户是否在群内…")
+        info_i18n("log.audit_start")
 
         def on_done(result: Dict[str, WatchAuditRow]) -> None:
             self.after(0, lambda: self._apply_watch_membership_audit(result))
 
         if not self._coord.request_watch_membership_audit(self._cfg, on_done):
-            info("当前无在线账号，无法检测群成员。")
+            info_i18n("log.audit_no_online")
 
     def _apply_watch_membership_audit(self, result: Dict[str, WatchAuditRow]) -> None:
         self._watch_audit_flags = {eid: row.status.value for eid, row in result.items()}
@@ -1714,14 +1837,17 @@ class MainWindow(ctk.CTkFrame):
         err = sum(1 for r in result.values() if r.status == WatchAuditStatus.ERROR)
         offline = sum(1 for r in result.values() if r.status == WatchAuditStatus.OFFLINE)
         self._render_group_rows(force=True)
-        parts = [f"已检测 {ok + absent} 条监听绑定"]
+        if not result:
+            info_i18n("log.audit_incomplete")
+            return
+        parts = [t("log.audit_checked", n=ok + absent)]
         if absent:
-            parts.append(f"{absent} 条用户不在群内（通讯录已标红）")
+            parts.append(t("log.audit_absent", n=absent))
         if err:
-            parts.append(f"{err} 条检测失败")
+            parts.append(t("log.audit_failed", n=err))
         if offline:
-            parts.append(f"{offline} 条归属账号未在线")
-        info("；".join(parts) + "。请到「通讯录」查看。")
+            parts.append(t("log.audit_offline", n=offline))
+        info(t("log.audit_summary", summary="；".join(parts)))
 
     def _sync_last_schedule_from_jobs(self) -> None:
         before = {e.id: (e.last_schedule_source_name or "").strip() for e in self._cfg.address_book}
@@ -1736,12 +1862,15 @@ class MainWindow(ctk.CTkFrame):
         self._sched_targets_dirty = False
         self._refresh_schedule_target_checks()
         if n_changed:
-            info(
-                f"已同步「上次任务」：任务管理 {n_jobs} 个任务，"
-                f"更新 {n_changed} 条通讯录（{n_filled} 条有标记，{len(self._cfg.address_book) - n_filled} 条为空）"
+            info_i18n(
+                "log.sync_last_changed",
+                n_jobs=n_jobs,
+                n_changed=n_changed,
+                n_filled=n_filled,
+                n_empty=len(self._cfg.address_book) - n_filled,
             )
         else:
-            info(f"「上次任务」已与任务管理一致（{n_jobs} 个任务，{n_filled} 条有标记）")
+            info_i18n("log.sync_last_unchanged", n_jobs=n_jobs, n_filled=n_filled)
 
     # --- schedule ---
     def _schedule_doc_path(self) -> str:
@@ -1756,7 +1885,7 @@ class MainWindow(ctk.CTkFrame):
         if os.path.isfile(path):
             webbrowser.open(Path(path).as_uri())
         else:
-            info(f"未找到示例文档：{path}")
+            info_i18n("log.doc_sample_not_found", path=path)
 
     def _page_schedule(self) -> ctk.CTkFrame:
         """群勾选在滚动区；间隔/TXT/添加固定在页底，勾群时无需来回滚动。"""
@@ -1767,23 +1896,22 @@ class MainWindow(ctk.CTkFrame):
         sf.pack(fill="x", padx=12, pady=10)
         ctk.CTkLabel(
             sf,
-            text="固定间隔（分钟，如 5-10；TXT 未写 间隔= 时使用）",
+            text=t("sched.fixed_interval"),
             text_color=COLORS["muted"],
         ).pack(anchor="w", pady=(0, 4))
-        self._sched_interval = ctk.CTkEntry(sf, placeholder_text="如 5-10")
+        self._sched_interval = ctk.CTkEntry(sf, placeholder_text="5-10")
         self._sched_interval.insert(0, "5-10")
         self._sched_interval.pack(fill="x", pady=(0, 6))
-        self._jfile = ctk.CTkEntry(sf, placeholder_text="选择 TXT 或文件夹（文件夹内按数字前缀排序，如 1.txt、3飞机.txt）")
+        self._jfile = ctk.CTkEntry(sf, placeholder_text=t("sched.file_ph"))
         self._jfile.pack(fill="x", pady=(0, 6))
-        ctk.CTkButton(sf, text="选择 TXT / 文件夹", fg_color=COLORS["border"], command=self._pick_schedule_source).pack(fill="x", pady=(0, 6))
-        ctk.CTkButton(sf, text="添加文档任务", fg_color=COLORS["accent"], command=self._add_job).pack(fill="x")
+        ctk.CTkButton(sf, text=t("sched.pick_source"), fg_color=COLORS["border"], command=self._pick_schedule_source).pack(fill="x", pady=(0, 6))
+        ctk.CTkButton(sf, text=t("sched.add_job"), fg_color=COLORS["accent"], command=self._add_job).pack(fill="x")
 
         wrap, finish_scroll = self._mount_main_scroll(page, footer=sched_foot)
-        ctk.CTkLabel(wrap, text="定时任务", font=ctk.CTkFont(size=22, weight="bold"), text_color=COLORS["text"]).pack(anchor="w", pady=8)
+        ctk.CTkLabel(wrap, text=t("sched.title"), font=ctk.CTkFont(size=22, weight="bold"), text_color=COLORS["text"]).pack(anchor="w", pady=8)
         sched_intro = ctk.CTkLabel(
             wrap,
-            text="可添加多个文档任务并行。TXT 里 账号=主号 表示由通讯录中该群选择的「归属账号」发送；"
-            "其它账号名保持不变。勾选几个群就创建几个独立任务，可分别开始/暂停；含主号时按各群归属账号映射。",
+            text=t("sched.tg_hint"),
             text_color=COLORS["muted"],
             wraplength=700,
             justify="left",
@@ -1791,14 +1919,14 @@ class MainWindow(ctk.CTkFrame):
         sched_intro.pack(anchor="w", pady=(0, 8))
         ctk.CTkButton(
             wrap,
-            text="打开 TXT 格式说明与示例",
+            text=t("sched.txt_format_tg"),
             fg_color=COLORS["border"],
-            command=self._open_schedule_import_doc,
+            command=lambda: webbrowser.open(Path(self._schedule_doc_path()).as_uri()) if os.path.isfile(self._schedule_doc_path()) else info_i18n("log.doc_sample_not_found", path=self._schedule_doc_path()),
         ).pack(anchor="w", pady=4)
 
         form = ctk.CTkFrame(wrap, fg_color=COLORS["card"], corner_radius=12, border_width=1, border_color=COLORS["border"])
         form.pack(fill="x", pady=8)
-        ctk.CTkLabel(form, text="勾选群发目标", text_color=COLORS["muted"]).pack(anchor="w", padx=12, pady=(10, 4))
+        ctk.CTkLabel(form, text=t("sched.targets"), text_color=COLORS["muted"]).pack(anchor="w", padx=12, pady=(10, 4))
         self._sched_targets = ctk.CTkFrame(form, fg_color="transparent")
         self._sched_targets.pack(fill="x", padx=10, pady=(4, 12))
 
@@ -1806,25 +1934,25 @@ class MainWindow(ctk.CTkFrame):
         edit_card.pack(fill="x", pady=8)
         ctk.CTkLabel(
             edit_card,
-            text="批量改发送账号（原文 → 实际发送）",
+            text=t("sched.bulk_title"),
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color=COLORS["text"],
         ).pack(anchor="w", padx=12, pady=(12, 8))
         pick_row = ctk.CTkFrame(edit_card, fg_color="transparent")
         pick_row.pack(fill="x", padx=12, pady=4)
-        ctk.CTkLabel(pick_row, text="选定任务", text_color=COLORS["muted"]).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(pick_row, text=t("sched.pick_job"), text_color=COLORS["muted"]).pack(side="left", padx=(0, 8))
         self._sched_job_pick = ctk.CTkComboBox(pick_row, width=280, values=["—"], command=self._on_sched_job_pick_changed)
         self._sched_job_pick.pack(side="left", fill="x", expand=True)
         bulk_row = ctk.CTkFrame(edit_card, fg_color="transparent")
         bulk_row.pack(fill="x", padx=12, pady=(4, 12))
-        ctk.CTkLabel(bulk_row, text="原文账号", text_color=COLORS["muted"]).grid(row=0, column=0, padx=(0, 8), pady=4, sticky="w")
+        ctk.CTkLabel(bulk_row, text=t("sched.from_account"), text_color=COLORS["muted"]).grid(row=0, column=0, padx=(0, 8), pady=4, sticky="w")
         self._sched_bulk_from_combo = ctk.CTkComboBox(bulk_row, width=160, values=["—"])
         self._sched_bulk_from_combo.grid(row=0, column=1, pady=4, sticky="w")
-        ctk.CTkLabel(bulk_row, text="改由账号发送", text_color=COLORS["muted"]).grid(row=1, column=0, padx=(0, 8), pady=4, sticky="w")
+        ctk.CTkLabel(bulk_row, text=t("sched.to_account_tg"), text_color=COLORS["muted"]).grid(row=1, column=0, padx=(0, 8), pady=4, sticky="w")
         acc0 = self._account_id_values()
         self._sched_bulk_to_combo = ctk.CTkComboBox(bulk_row, width=160, values=acc0)
         self._sched_bulk_to_combo.grid(row=1, column=1, pady=4, sticky="w")
-        ctk.CTkButton(bulk_row, text="批量替换", fg_color=COLORS["border"], command=self._schedule_bulk_replace_by_original).grid(
+        ctk.CTkButton(bulk_row, text=t("sched.bulk_replace"), fg_color=COLORS["border"], command=self._schedule_bulk_replace_by_original).grid(
             row=2, column=0, columnspan=2, sticky="w", pady=8
         )
 
@@ -1833,7 +1961,7 @@ class MainWindow(ctk.CTkFrame):
 
         sched_note = ctk.CTkLabel(
             wrap,
-            text="任务运行状态、暂停/继续请在侧栏「任务管理」中查看与控制；本页仅用于添加任务与批量改账号。",
+            text=t("sched.status_hint"),
             text_color=COLORS["muted"],
             wraplength=700,
             justify="left",
@@ -1846,19 +1974,19 @@ class MainWindow(ctk.CTkFrame):
     def _page_task_manager(self) -> ctk.CTkFrame:
         page = ctk.CTkFrame(self._content, fg_color="transparent")
         wrap, finish_scroll = self._mount_main_scroll(page)
-        ctk.CTkLabel(wrap, text="任务管理", font=ctk.CTkFont(size=22, weight="bold"), text_color=COLORS["text"]).pack(
+        ctk.CTkLabel(wrap, text=t("taskmgr.title"), font=ctk.CTkFont(size=22, weight="bold"), text_color=COLORS["text"]).pack(
             anchor="w", pady=(8, 4)
         )
         ctk.CTkLabel(
             wrap,
-            text="每个任务一张卡片：绿色=运行中，金色=监听暂停，紫色=提醒+监听，红色=其它暂停，灰色=已停止。点击卡片可切换运行/暂停。",
+            text=t("taskmgr.legend"),
             text_color=COLORS["muted"],
             wraplength=700,
             justify="left",
         ).pack(anchor="w", pady=(0, 6))
         self._taskmgr_count_lbl = ctk.CTkLabel(
             wrap,
-            text="任务数量：0",
+            text=t("taskmgr.count.total", total=0),
             font=ctk.CTkFont(size=14, weight="bold"),
             text_color=COLORS["text"],
             anchor="w",
@@ -1866,7 +1994,7 @@ class MainWindow(ctk.CTkFrame):
         self._taskmgr_count_lbl.pack(anchor="w", pady=(0, 10))
         ctk.CTkButton(
             wrap,
-            text="一键开始全部任务",
+            text=t("taskmgr.resume_all"),
             fg_color=COLORS["accent"],
             hover_color="#3d7ae6",
             height=40,
@@ -1874,24 +2002,44 @@ class MainWindow(ctk.CTkFrame):
         ).pack(fill="x", pady=(0, 10))
         ctk.CTkButton(
             wrap,
-            text="一键开始下一天",
+            text=t("taskmgr.next_day"),
             fg_color="#5a4a12",
             hover_color="#6d5a18",
             height=38,
-            command=self._start_next_folder_day,
+            command=lambda: self.after(10, self._start_next_folder_day),
         ).pack(fill="x", pady=(0, 10))
         self._btn_manual_folder_day = ctk.CTkButton(
             wrap,
-            text="手动下一天",
+            text=t("taskmgr.manual_day"),
             fg_color="#2a4a5a",
             hover_color="#356878",
             height=38,
             command=self._toggle_manual_folder_advance_mode,
         )
         self._btn_manual_folder_day.pack(fill="x", pady=(0, 10))
+        img_row = ctk.CTkFrame(wrap, fg_color="transparent")
+        img_row.pack(fill="x", pady=(0, 10))
+        img_row.grid_columnconfigure(0, weight=1)
+        img_row.grid_columnconfigure(1, weight=1)
+        ctk.CTkButton(
+            img_row,
+            text=t("img.btn"),
+            fg_color="#4a3060",
+            hover_color="#5c3c78",
+            height=38,
+            command=lambda: self.after(10, self._one_click_send_images),
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ctk.CTkButton(
+            img_row,
+            text=t("img.btn_sync"),
+            fg_color="#3a4060",
+            hover_color="#4a5078",
+            height=38,
+            command=lambda: self.after(10, self._one_click_send_images_sync),
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
         ctk.CTkButton(
             wrap,
-            text="一键删除全部任务",
+            text=t("taskmgr.delete_all"),
             fg_color=COLORS["danger"],
             hover_color="#b63a3a",
             height=38,
@@ -1907,29 +2055,31 @@ class MainWindow(ctk.CTkFrame):
         return bool(j.enabled) and j.state == "running"
 
     def _doc_job_status_label(self, j: ScheduledJob) -> str:
-        if not j.enabled:
-            reason = (j.pause_reason or "").strip()
-            if reason:
-                return f"已停止 · {reason[:24]}"
-            return "已停止"
-        if j.state == "paused":
-            return f"暂停 · {(j.pause_reason or '已暂停')[:28]}"
-        return "运行中"
+        return format_job_status_label(
+            enabled=bool(j.enabled),
+            state=j.state,
+            pause_reason=j.pause_reason or "",
+        )
 
     def _doc_job_step_label(self, j: ScheduledJob) -> str:
         total = j.item_count()
         if total <= 0:
-            return "无发送步骤"
+            return t("job_step.none")
+        if is_await_image_send(j.pause_reason or ""):
+            step_no = max(1, int(j.cursor or 0))
+            return t("job_step.image", cur=min(step_no, total), total=total)
         if j.cursor >= total:
-            return f"已完成（{total}/{total} 步）"
+            return t("job_step.done", cur=total, total=total)
         step_no = j.cursor + 1
         item = j.current_item()
         if item is None:
-            return f"第 {step_no}/{total} 步"
+            return t("job_step.item", cur=step_no, total=total, preview="")
         if item.is_reminder:
-            return f"第 {step_no}/{total} 步 · 阶段提醒"
+            return t("job_step.reminder", cur=step_no, total=total)
+        if getattr(item, "is_image_send", False):
+            return t("job_step.image", cur=step_no, total=total)
         preview = (item.content or "").replace("\n", " ").strip()[:28]
-        return f"第 {step_no}/{total} 步 · {preview or '…'}"
+        return t("job_step.item", cur=step_no, total=total, preview=preview or t("job_step.ellipsis"))
 
     def _bind_taskmgr_card_click(self, widget: ctk.CTkBaseClass, job_id: str) -> None:
         if isinstance(widget, ctk.CTkButton):
@@ -1961,25 +2111,7 @@ class MainWindow(ctk.CTkFrame):
         )
 
     def _task_reminder_summary(self, j: ScheduledJob) -> str:
-        notes: List[str] = []
-        for it in j.items:
-            if not getattr(it, "is_reminder", False):
-                continue
-            t = (getattr(it, "reminder_note", "") or "").strip()
-            if t:
-                notes.append(t)
-        if not notes:
-            return ""
-        idx = max(0, j.cursor - 1)
-        for k in range(idx, -1, -1):
-            if k >= len(j.items):
-                continue
-            it = j.items[k]
-            if getattr(it, "is_reminder", False):
-                t = (getattr(it, "reminder_note", "") or "").strip()
-                if t:
-                    return t[:56]
-        return notes[0][:56]
+        return operator_note_for_items(j.items, cursor=int(j.cursor or 0), max_len=56)
 
     def _apply_taskmgr_tile(self, w: Dict[str, Any], j: ScheduledJob) -> None:
         running = self._doc_job_is_running(j)
@@ -2002,15 +2134,15 @@ class MainWindow(ctk.CTkFrame):
         rem_bg = "#ffd24a"
         w["reminder_box"].configure(fg_color=rem_bg)
         w["reminder"].configure(
-            text=(f"提醒：{rem}" if rem else "提醒：无"),
+            text=(t("taskmgr.note", text=rem) if rem else t("taskmgr.note_none")),
             text_color=rem_c if rem else "#5c4a00",
         )
-        hint = "点击暂停" if running else ("点击继续" if j.enabled else "点击重新开始")
+        hint = t("taskmgr.hint_pause") if running else (t("taskmgr.hint_resume") if j.enabled else t("taskmgr.hint_restart"))
         if self._manual_folder_advance_mode and is_folder_job(j):
             hint = (
-                "点击切换下一天"
+                t("taskmgr.hint_next_day")
                 if can_advance_folder_day(j)
-                else "已是最后一天（一键下一天可删）"
+                else t("taskmgr.hint_last_day")
             )
         w["hint"].configure(text=hint, text_color=pal["hint"])
 
@@ -2043,7 +2175,7 @@ class MainWindow(ctk.CTkFrame):
         title.pack(side="left", fill="x", expand=True)
         ctk.CTkButton(
             head,
-            text="删除",
+            text=t("common.delete"),
             width=52,
             height=24,
             font=fonts["btn"],
@@ -2113,33 +2245,70 @@ class MainWindow(ctk.CTkFrame):
             self._taskmgr_widgets[j.id] = self._build_taskmgr_tile(j, i)
             self._taskmgr_fp_cache[j.id] = self._taskmgr_fingerprint(j)
 
-    def _patch_taskmgr_grid(self, jobs: List[ScheduledJob]) -> None:
+    def _patch_taskmgr_cards(
+        self,
+        job_ids: Iterable[str],
+        *,
+        reorder: bool = True,
+        job_overrides: Optional[Dict[str, ScheduledJob]] = None,
+    ) -> None:
+        """只更新指定卡片的文案/颜色；可选重排一次（保留置顶规则）。"""
+        if getattr(self, "_taskmgr_cards", None) is None:
+            return
+        unique_ids = list(dict.fromkeys(job_ids))
+        if not unique_ids:
+            return
+        overrides = dict(job_overrides or {})
+        jobs = load_jobs()
+        job_map = {j.id: j for j in jobs}
+        job_map.update(overrides)
+        merged_jobs: List[ScheduledJob] = []
+        seen: Set[str] = set()
         for j in jobs:
-            fp = self._taskmgr_fingerprint(j)
-            if self._taskmgr_fp_cache.get(j.id) == fp:
+            merged_jobs.append(job_map[j.id])
+            seen.add(j.id)
+        for jid, oj in overrides.items():
+            if jid not in seen:
+                merged_jobs.append(oj)
+        for jid in unique_ids:
+            j = job_map.get(jid)
+            if j is None:
                 continue
-            self._taskmgr_fp_cache[j.id] = fp
-            w = self._taskmgr_widgets.get(j.id)
-            if w:
-                self._apply_taskmgr_tile(w, j)
+            w = self._taskmgr_widgets.get(jid)
+            if w is None:
+                continue
+            self._taskmgr_fp_cache[jid] = self._taskmgr_fingerprint(j)
+            self._apply_taskmgr_tile(w, j)
+        self._update_taskmgr_count_label(merged_jobs)
+        if reorder:
+            self._sync_taskmgr_display_order(merged_jobs)
 
     def _refresh_taskmgr_card(self, job_id: str) -> None:
-        """仅刷新单张任务卡片（点击切换状态时用，避免全页重建）。"""
+        """单卡暂停/继续：只 patch 该卡并重排。"""
         if getattr(self, "_taskmgr_cards", None) is None:
             return
         jobs = load_jobs()
-        j = next((x for x in jobs if x.id == job_id), None)
-        if j is None:
+        if next((x for x in jobs if x.id == job_id), None) is None:
             self._render_taskmgr_cards(force=True)
             return
-        w = self._taskmgr_widgets.get(job_id)
-        if w is None:
+        if self._taskmgr_widgets.get(job_id) is None:
+            self._sync_taskmgr_page()
+            return
+        self._patch_taskmgr_cards([job_id], reorder=True)
+
+    def _sync_taskmgr_page(self) -> None:
+        """进入任务管理页时手动同步（非定时刷新）。"""
+        if getattr(self, "_taskmgr_cards", None) is None:
+            return
+        jobs = load_jobs()
+        if not jobs:
             self._render_taskmgr_cards(force=False)
             return
-        self._taskmgr_fp_cache[job_id] = self._taskmgr_fingerprint(j)
-        self._apply_taskmgr_tile(w, j)
-        self._update_taskmgr_count_label(jobs)
-        self._sync_taskmgr_display_order(jobs)
+        ids = [j.id for j in jobs]
+        if ids != self._taskmgr_listed_ids:
+            self._render_taskmgr_cards(force=True)
+            return
+        self._patch_taskmgr_cards([j.id for j in jobs], reorder=True)
 
     def _sync_taskmgr_display_order(self, jobs: List[ScheduledJob]) -> None:
         display_jobs = taskmgr_sort_jobs_for_display(jobs, is_running=self._doc_job_is_running)
@@ -2167,10 +2336,11 @@ class MainWindow(ctk.CTkFrame):
             return
         self._sched_job_fingerprints[job_id] = self._sched_job_fingerprint(j)
         w["detail"].configure(text=self._job_detail_text(j))
-        w["btn_run"].configure(text=("继续" if j.state == "paused" else "暂停"))
-        w["btn_en"].configure(text=("停用" if j.enabled else "启用"))
+        w["btn_run"].configure(text=(t("taskmgr.hint_resume") if j.state == "paused" else t("taskmgr.hint_pause")))
+        w["btn_en"].configure(text=(t("dash.disabled") if j.enabled else t("dash.enabled")))
 
     def _render_taskmgr_cards(self, *, force: bool = False) -> None:
+        """增删任务或结构变化时重建网格；不做定时刷新，也不联动定时任务页控件。"""
         if getattr(self, "_taskmgr_cards", None) is None:
             return
         jobs = load_jobs()
@@ -2186,11 +2356,10 @@ class MainWindow(ctk.CTkFrame):
             if not self._taskmgr_cards.winfo_children():
                 ctk.CTkLabel(
                     self._taskmgr_cards,
-                    text="尚无文档任务，请先在「定时任务」页添加。",
+                    text=t("taskmgr.empty_doc"),
                     text_color=COLORS["muted"],
                 ).grid(row=0, column=0, columnspan=TASKMGR_COLS, sticky="w", padx=8, pady=12)
             self._update_taskmgr_count_label(jobs)
-            self._sync_sched_job_pick_combo()
             return
         display_jobs = taskmgr_sort_jobs_for_display(jobs, is_running=self._doc_job_is_running)
         display_ids = [j.id for j in display_jobs]
@@ -2198,14 +2367,168 @@ class MainWindow(ctk.CTkFrame):
             self._taskmgr_listed_ids = ids
             self._full_rebuild_taskmgr_grid(display_jobs)
             self._taskmgr_display_ids = display_ids
-        else:
-            self._patch_taskmgr_grid(jobs)
-            self._sync_taskmgr_display_order(jobs)
         self._update_taskmgr_count_label(jobs)
-        self._sync_sched_job_pick_combo()
         handler = getattr(self, "_scroll_wheel_handler", None)
         if handler:
             bind_scroll_tree_once(self._taskmgr_cards, handler)
+
+    def _one_click_send_images(self) -> None:
+        self._one_click_send_images_flow(sync_to_customer=False, customer_extra_text="")
+
+    def _one_click_send_images_sync(self) -> None:
+        if getattr(self, "_bulk_image_busy", False):
+            info_i18n("img.busy")
+            return
+        extra = self._prompt_customer_extra_text()
+        if extra is None:
+            return
+        self._one_click_send_images_flow(sync_to_customer=True, customer_extra_text=extra)
+
+    def _prompt_customer_extra_text(self) -> Optional[str]:
+        """同步客户附加文字输入框。返回 None=取消；空字符串=不附加文字。"""
+        return prompt_text_with_skip(
+            self,
+            t("img.extra_title"),
+            t("img.extra_hint"),
+            ok_text=t("img.extra_ok"),
+            skip_text=t("img.extra_skip"),
+            cancel_text=t("img.cancel"),
+        )
+
+    def _one_click_send_images_flow(
+        self, *, sync_to_customer: bool, customer_extra_text: str
+    ) -> None:
+        if getattr(self, "_bulk_image_busy", False):
+            info_i18n("img.busy")
+            return
+        jobs = collect_awaiting_image_jobs(load_jobs())
+        if not jobs:
+            title = "img.btn_sync" if sync_to_customer else "img.btn"
+            msg_info(self, title, "img.none")
+            return
+        groups = group_awaiting_by_day(jobs)
+        labels: List[str] = []
+        for g in groups:
+            n = len(g.jobs)
+            notes = notes_for_awaiting_jobs(g.jobs)
+            notes_part = t("img.day_notes", text=notes) if notes else ""
+            labels.append(
+                t("img.day_group", day=g.day_1based, n=n, notes=notes_part)
+                if g.day_1based > 0
+                else t("img.day_other", n=n, notes=notes_part)
+            )
+        idx = pick_button_option(
+            self,
+            t("img.pick_day"),
+            labels,
+            cancel_text=t("img.cancel"),
+        )
+        if idx is None or idx < 0 or idx >= len(groups):
+            return
+        g = groups[idx]
+        run_after_modal_closed(
+            self,
+            280,
+            lambda: self._start_bulk_image_for_group(
+                g.day_1based,
+                list(g.jobs),
+                sync_to_customer=sync_to_customer,
+                customer_extra_text=customer_extra_text,
+            ),
+        )
+
+    def _start_bulk_image_for_group(
+        self,
+        day: int,
+        group_jobs: List[ScheduledJob],
+        *,
+        sync_to_customer: bool = False,
+        customer_extra_text: str = "",
+    ) -> None:
+        n = len(group_jobs)
+        if n <= 0:
+            return
+        title_key = "img.btn_sync" if sync_to_customer else "img.btn"
+        if sync_to_customer:
+            body_key = "img.confirm_sync" if day > 0 else "img.confirm_sync_other"
+        else:
+            body_key = "img.confirm" if day > 0 else "img.confirm_other"
+        kwargs = {"n": n, "day": day} if day > 0 else {"n": n}
+        release_modal_grabs(self)
+        if not msg_askyesno(self, title_key, body_key, **kwargs):
+            return
+        run_after_modal_closed(
+            self,
+            300,
+            lambda: self._bulk_image_after_pick(
+                day,
+                group_jobs,
+                sync_to_customer=sync_to_customer,
+                customer_extra_text=customer_extra_text,
+                title_key=title_key,
+            ),
+        )
+
+    def _bulk_image_after_pick(
+        self,
+        day: int,
+        group_jobs: List[ScheduledJob],
+        *,
+        sync_to_customer: bool,
+        customer_extra_text: str,
+        title_key: str,
+    ) -> None:
+        selected = pick_image_files(self, title=t("img.pick_files"))
+        if not selected:
+            return
+        if len(selected) > MAX_BULK_IMAGES:
+            msg_info(self, title_key, "img.too_many", max_n=MAX_BULK_IMAGES)
+            return
+        coord = self._coord
+        if coord is None or not getattr(coord, "request_bulk_image_send", None):
+            info_i18n("log.coord_not_running")
+            return
+        self._bulk_image_busy = True
+        if sync_to_customer:
+            info_i18n("img.busy_sync")
+        else:
+            info_i18n("img.busy_multi", count=len(selected))
+        job_ids = [j.id for j in group_jobs]
+        target_map = {j.id: self._job_target_short(j) for j in group_jobs}
+
+        def on_progress(i: int, total: int, res: Any) -> None:
+            status = "ok" if getattr(res, "ok", False) else f"fail:{getattr(res, 'error', '')}"
+            tgt = target_map.get(getattr(res, "job_id", ""), getattr(res, "job_id", ""))
+
+            def ui() -> None:
+                info(t("img.progress", i=i, total=total, target=tgt, status=status))
+
+            try:
+                self.after(0, ui)
+            except Exception:
+                pass
+
+        def on_done(ok: int, fail: int, resumed: int) -> None:
+            def ui() -> None:
+                self._bulk_image_busy = False
+                info(t("img.done", ok=ok, fail=fail, resumed=resumed))
+                self._render_taskmgr_cards(force=True)
+
+            try:
+                self.after(0, ui)
+            except Exception:
+                self._bulk_image_busy = False
+
+        if not coord.request_bulk_image_send(
+            job_ids,
+            image_paths=selected,
+            on_progress=on_progress,
+            on_done=on_done,
+            sync_to_customer=sync_to_customer,
+            customer_extra_text=customer_extra_text,
+        ):
+            self._bulk_image_busy = False
+            info_i18n("log.coord_not_running")
 
     def _resume_all_doc_jobs(self) -> None:
         jobs = load_jobs()
@@ -2213,33 +2536,33 @@ class MainWindow(ctk.CTkFrame):
         if resumable <= 0:
             running = sum(1 for j in jobs if self._doc_job_is_running(j))
             if running > 0:
-                info(
-                    f"当前 {running} 个任务已是运行中；若仍不发送，请确认账号已连接后点「保存并重载服务」。"
-                )
+                info_i18n("log.resume_all_connected", running=running)
             elif skipped > 0:
-                info(f"没有可恢复的暂停任务（{skipped} 个已完成任务已跳过）。")
+                info_i18n("log.resume_all_none_skipped", skipped=skipped)
             else:
-                info("没有可恢复的暂停或已停止任务")
+                info_i18n("log.resume_all_none")
             return
-        msg = f"将恢复 {resumable} 个暂停中的文档任务继续发送。"
-        if skipped > 0:
-            msg += f"\n\n{skipped} 个已完成的任务将被跳过（需重跑请点对应卡片）。"
-        msg += "\n\n确定继续？"
-        if not messagebox.askyesno("一键开始全部任务", msg, parent=self):
+        skipped_line = t("msgbox.resume_all.skipped", skipped=skipped) if skipped > 0 else ""
+        body_kwargs = {"resumable": resumable, "skipped_line": skipped_line}
+        if not msg_askyesno(self, "msgbox.resume_all.title", "msgbox.resume_all.body_doc", **body_kwargs):
             return
         n = self._scheduler.resume_all_jobs()
         self._cfg = load_config()
         self._refresh_schedule_target_checks()
-        self._render_taskmgr_cards()
+        jobs = load_jobs()
+        if jobs and self._taskmgr_listed_ids == [j.id for j in jobs]:
+            self._patch_taskmgr_cards([j.id for j in jobs], reorder=True)
+        else:
+            self._render_taskmgr_cards(force=True)
         self._render_jobs()
         if n > 0:
             self._warn_if_tg_session_down()
             if skipped > 0:
-                info(f"已恢复 {n} 个文档任务为运行中（已跳过 {skipped} 个已完成任务）")
+                info_i18n("log.resume_all_doc_done_skipped", n=n, skipped=skipped)
             else:
-                info(f"已恢复 {n} 个文档任务为运行中")
+                info_i18n("log.resume_all_doc_done", n=n)
             return
-        info("没有可恢复的暂停或已停止任务")
+        info_i18n("log.resume_all_none")
 
     def _pick_schedule_source(self) -> None:
         cur = self._jfile.get() if getattr(self, "_jfile", None) else ""
@@ -2249,10 +2572,10 @@ class MainWindow(ctk.CTkFrame):
             self._jfile.insert(0, path)
 
     def _parse_interval_minutes(self, s: str) -> Optional[tuple[float, float]]:
-        t = (s or "").strip()
-        if not t:
+        raw = (s or "").strip()
+        if not raw:
             return None
-        m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*$", t)
+        m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*$", raw)
         if m:
             a = float(m.group(1))
             b = float(m.group(2))
@@ -2261,19 +2584,26 @@ class MainWindow(ctk.CTkFrame):
             if b < a:
                 a, b = b, a
             return (a, b)
-        if re.match(r"^\d+(?:\.\d+)?$", t):
-            x = float(t)
+        if re.match(r"^\d+(?:\.\d+)?$", raw):
+            x = float(raw)
             if x <= 0:
                 return None
             return (x, x)
         return None
 
-    def _sched_add_fail(self, msg: str) -> None:
-        info(msg)
-        try:
-            messagebox.showwarning("无法添加文档任务", msg, parent=self)
-        except Exception:
-            pass
+    def _sched_add_fail(self, key: str, **kwargs: object) -> None:
+        if "." in key and not key.startswith("\n"):
+            info_i18n(key, **kwargs)
+            try:
+                msg_info(self, "msgbox.cannot_add_doc.title", key, **kwargs)
+            except Exception:
+                pass
+        else:
+            info(key)
+            try:
+                show_message(self, t("msgbox.cannot_add_doc.title"), key)
+            except Exception:
+                pass
 
     def _add_job(self) -> None:
         selected_ids: List[str] = []
@@ -2288,38 +2618,35 @@ class MainWindow(ctk.CTkFrame):
                 if i < len(vars_list) and vars_list[i].get():
                     selected_ids.append(ent.id)
         if not selected_ids:
-            self._sched_add_fail("请至少勾选一个通讯录中的群发目标。")
+            self._sched_add_fail("log.need_select_group")
             return
         path = self._jfile.get().strip()
         if not path:
-            self._sched_add_fail("请先选择 TXT 文件或文件夹。")
+            self._sched_add_fail("log.need_txt_or_folder")
             return
         if os.path.isdir(path):
             self._add_folder_jobs(path, selected_ids)
             return
         if not os.path.isfile(path):
-            self._sched_add_fail("路径无效，请选择 TXT 文件或文件夹。")
+            self._sched_add_fail("log.path_invalid")
             return
         try:
             with open(path, "r", encoding="utf-8") as f:
                 text = f.read()
         except UnicodeDecodeError:
-            self._sched_add_fail("TXT 解码失败，请另存为 UTF-8 编码。")
+            self._sched_add_fail("folder.read_decode_fail")
             return
         except OSError as exc:
-            self._sched_add_fail(f"读取 TXT 失败：{exc}")
+            self._sched_add_fail("folder.read_fail", err=exc)
             return
         valid = {a.id for a in self._cfg.accounts}
         if not valid:
-            self._sched_add_fail("请先在「账号管理」添加至少一个账号。")
+            self._sched_add_fail("log.need_account_first")
             return
         items, errors = import_doc_items(text, valid_accounts=valid, require_per_item_interval=False)
-        sends = [it for it in items if not it.is_reminder]
+        sends = [it for it in items if not it.is_non_send_step()]
         if not sends:
-            hint = "TXT 中没有可发送条目（需 账号= 与 消息=，可用 [条目] 分段）。"
-            if errors:
-                hint += "\n" + "\n".join(errors[:8])
-            self._sched_add_fail(hint)
+            self._sched_add_fail("log.txt_no_items")
             return
         if errors:
             for e in errors[:10]:
@@ -2330,27 +2657,23 @@ class MainWindow(ctk.CTkFrame):
         max_m = 0.0
         if all_txt:
             mode = "txt"
-            interval_note = "间隔：TXT 每条 间隔="
+            interval_note = t("sched.interval.txt_only")
         else:
             interval = self._parse_interval_minutes(
                 self._sched_interval.get().strip() if getattr(self, "_sched_interval", None) else ""
             )
             if interval is None:
                 if any_txt:
-                    self._sched_add_fail(
-                        "部分条目未写 间隔=，请在底部「固定间隔」填写补充间隔（分钟），格式：5 或 5-10。"
-                    )
+                    self._sched_add_fail("log.interval_invalid")
                 else:
-                    self._sched_add_fail(
-                        "TXT 未写每条 间隔= 时，请在底部「固定间隔」填写分钟数，格式：5 或 5-10。"
-                    )
+                    self._sched_add_fail("log.interval_invalid")
                 return
             min_m, max_m = interval
             mode = "mixed" if any_txt else "fixed"
             interval_note = (
-                f"间隔：TXT 优先 + 固定 {min_m:g}-{max_m:g} 分/条"
+                t("sched.interval.txt_plus_fixed", min_m=min_m, max_m=max_m)
                 if any_txt
-                else f"间隔：固定 {min_m:g}-{max_m:g} 分钟"
+                else t("sched.interval.fixed", min_m=min_m, max_m=max_m)
             )
         has_main = doc_has_main_account_placeholder(items)
         by_eid = {e.id: e for e in self._cfg.address_book}
@@ -2375,14 +2698,12 @@ class MainWindow(ctk.CTkFrame):
                     skipped.append(ent.remark.strip() or ent.id)
                     continue
                 if owner not in valid:
-                    self._sched_add_fail(
-                        f"群「{ent.remark}」归属账号「{owner}」未在账号管理中启用，请先登录该账号。"
-                    )
+                    self._sched_add_fail("log.need_group_owner", group=ent.remark)
                     return
                 job_items = clone_doc_items(items)
                 mapped = apply_main_account_mapping(job_items, owner)
                 if mapped == 0:
-                    self._sched_add_fail("文档中未找到 账号=主号（或主账号）条目。")
+                    self._sched_add_fail("log.job_create_failed")
                     return
             else:
                 job_items = clone_doc_items(items)
@@ -2405,37 +2726,33 @@ class MainWindow(ctk.CTkFrame):
             created.append(job)
 
         if skipped:
-            info("以下群未在通讯录选择归属账号，已跳过：" + "、".join(skipped))
+            info_i18n("log.skipped_no_owner", names="、".join(skipped))
         if not created:
             if has_main:
-                self._sched_add_fail("未能为任何所选群创建任务：请先在通讯录为各群选择「归属账号」。")
+                self._sched_add_fail("log.job_create_failed")
             else:
-                self._sched_add_fail("未能创建任务。")
+                self._sched_add_fail("log.job_create_failed")
             return
 
         save_jobs(jobs)
         apply_last_schedule_for_jobs(self._cfg, created)
         self._sched_edit_job_id = created[-1].id
-        self._render_taskmgr_cards()
-        main_note = ""
-        if has_main:
-            main_note = "；账号=主号 已按各群归属账号自动映射"
-        j0 = created[0]
+        self._render_taskmgr_cards(force=True)
+        self._sync_sched_job_pick_combo()
+        steps_lbl = t("sched.job_steps", n=len(items))
         if len(created) > 1:
-            info(
-                f"已为 {len(created)} 个群各添加 1 个文档任务（默认暂停）：{j0.source_name}（{len(items)} 步，{interval_note}）{main_note}"
-            )
+            info_i18n("log.job_added_multi", n=len(created), name=j0.source_name, steps=steps_lbl)
         else:
-            info(
-                f"已添加文档任务（默认暂停）：{self._job_target_short(j0)} · {j0.source_name}（{len(items)} 步，{interval_note}）{main_note}"
-            )
+            info_i18n("log.job_added_single", name=j0.source_name, steps=steps_lbl)
         self._clear_sched_target_selection()
         self._refresh_schedule_target_checks()
 
     def _add_folder_jobs(self, folder_path: str, selected_ids: List[str]) -> None:
         rel_files, scan_errs = scan_schedule_folder(folder_path)
         if scan_errs:
-            self._sched_add_fail("\n".join(scan_errs))
+            for err in scan_errs[:8]:
+                info(err)
+            self._sched_add_fail("log.path_invalid")
             return
         folder_abs = os.path.abspath(folder_path)
         first_rel = rel_files[0]
@@ -2444,22 +2761,19 @@ class MainWindow(ctk.CTkFrame):
             with open(first_path, "r", encoding="utf-8") as f:
                 text = f.read()
         except UnicodeDecodeError:
-            self._sched_add_fail("TXT 解码失败，请另存为 UTF-8 编码。")
+            self._sched_add_fail("folder.read_decode_fail")
             return
         except OSError as exc:
-            self._sched_add_fail(f"读取 TXT 失败：{exc}")
+            self._sched_add_fail("folder.read_fail", err=exc)
             return
         valid = {a.id for a in self._cfg.accounts}
         if not valid:
-            self._sched_add_fail("请先在「账号管理」添加至少一个账号。")
+            self._sched_add_fail("log.need_account_first")
             return
         items, errors = import_doc_items(text, valid_accounts=valid, require_per_item_interval=False)
-        sends = [it for it in items if not it.is_reminder]
+        sends = [it for it in items if not it.is_non_send_step()]
         if not sends:
-            hint = "首份 TXT 中没有可发送条目（需 账号= 与 消息=）。"
-            if errors:
-                hint += "\n" + "\n".join(errors[:8])
-            self._sched_add_fail(hint)
+            self._sched_add_fail("log.folder_first_no_items")
             return
         if errors:
             for e in errors[:10]:
@@ -2474,30 +2788,24 @@ class MainWindow(ctk.CTkFrame):
         if all_txt:
             mode = "txt"
             if not ui_interval:
-                self._sched_add_fail(
-                    "文件夹任务请在底部「固定间隔」填写分钟数（供某天 TXT 未写 间隔= 时使用），格式：5 或 5-10。"
-                )
+                self._sched_add_fail("sched.folder_interval_hint")
                 return
             min_m, max_m = ui_interval
-            interval_note = f"间隔：TXT 每条 间隔=；无间隔条目用固定 {min_m:g}-{max_m:g} 分"
+            interval_note = t("sched.interval.txt_mixed_fixed", min_m=min_m, max_m=max_m)
         else:
             interval = ui_interval
             if interval is None:
                 if any_txt:
-                    self._sched_add_fail(
-                        "部分条目未写 间隔=，请在底部「固定间隔」填写补充间隔（分钟），格式：5 或 5-10。"
-                    )
+                    self._sched_add_fail("log.interval_invalid")
                 else:
-                    self._sched_add_fail(
-                        "TXT 未写每条 间隔= 时，请在底部「固定间隔」填写分钟数，格式：5 或 5-10。"
-                    )
+                    self._sched_add_fail("log.interval_invalid")
                 return
             min_m, max_m = interval
             mode = "mixed" if any_txt else "fixed"
             interval_note = (
-                f"间隔：TXT 优先 + 固定 {min_m:g}-{max_m:g} 分/条"
+                t("sched.interval.txt_plus_fixed", min_m=min_m, max_m=max_m)
                 if any_txt
-                else f"间隔：固定 {min_m:g}-{max_m:g} 分钟"
+                else t("sched.interval.fixed", min_m=min_m, max_m=max_m)
             )
         has_main = doc_has_main_account_placeholder(items)
         by_eid = {e.id: e for e in self._cfg.address_book}
@@ -2521,14 +2829,12 @@ class MainWindow(ctk.CTkFrame):
                     skipped.append(ent.remark.strip() or ent.id)
                     continue
                 if owner not in valid:
-                    self._sched_add_fail(
-                        f"群「{ent.remark}」归属账号「{owner}」未在账号管理中启用，请先登录该账号。"
-                    )
+                    self._sched_add_fail("log.need_group_owner", group=ent.remark)
                     return
                 job_items = clone_doc_items(items)
                 mapped = apply_main_account_mapping(job_items, owner)
                 if mapped == 0:
-                    self._sched_add_fail("文档中未找到 账号=主号（或主账号）条目。")
+                    self._sched_add_fail("log.job_create_failed")
                     return
             else:
                 job_items = clone_doc_items(items)
@@ -2555,34 +2861,27 @@ class MainWindow(ctk.CTkFrame):
             created.append(job)
 
         if skipped:
-            info("以下群未在通讯录选择归属账号，已跳过：" + "、".join(skipped))
+            info_i18n("log.skipped_no_owner", names="、".join(skipped))
         if not created:
             if has_main:
-                self._sched_add_fail("未能为任何所选群创建任务：请先在通讯录为各群选择「归属账号」。")
+                self._sched_add_fail("log.job_create_failed")
             else:
-                self._sched_add_fail("未能创建任务。")
+                self._sched_add_fail("log.job_create_failed")
             return
 
         save_jobs(jobs)
         apply_last_schedule_for_jobs(self._cfg, created)
         self._sched_edit_job_id = created[-1].id
-        self._render_taskmgr_cards()
-        main_note = ""
-        if has_main:
-            main_note = "；账号=主号 已按各群归属账号自动映射"
-        j0 = created[0]
-        names_preview = "、".join(rel_files[:5])
-        if len(rel_files) > 5:
-            names_preview += f" 等 {len(rel_files)} 个"
+        self._render_taskmgr_cards(force=True)
+        self._sync_sched_job_pick_combo()
         if len(created) > 1:
-            info(
-                f"已为 {len(created)} 个群各添加 1 个文件夹任务（{len(rel_files)} 天，默认暂停）："
-                f"{names_preview}{main_note}"
-            )
+            info_i18n("log.folder_job_added_multi", n=len(created), days=len(rel_files))
         else:
-            info(
-                f"已添加文件夹任务（{len(rel_files)} 天，默认暂停）：{self._job_target_short(j0)} · "
-                f"第 1 天 {j0.source_name}（{len(items)} 步，{interval_note}）{main_note}"
+            info_i18n(
+                "log.folder_job_added_single",
+                days=len(rel_files),
+                name=j0.source_name,
+                steps=t("sched.job_steps", n=len(items)),
             )
         self._clear_sched_target_selection()
         self._refresh_schedule_target_checks()
@@ -2592,18 +2891,20 @@ class MainWindow(ctk.CTkFrame):
         if btn is None:
             return
         if self._manual_folder_advance_mode:
-            btn.configure(text="取消手动下一天", fg_color="#6a3a12", hover_color="#7d4518")
+            btn.configure(text=t("taskmgr.manual_day_cancel"), fg_color="#6a3a12", hover_color="#7d4518")
         else:
-            btn.configure(text="手动下一天", fg_color="#2a4a5a", hover_color="#356878")
+            btn.configure(text=t("taskmgr.manual_day"), fg_color="#2a4a5a", hover_color="#356878")
 
     def _toggle_manual_folder_advance_mode(self) -> None:
         self._manual_folder_advance_mode = not self._manual_folder_advance_mode
         self._sync_manual_folder_advance_btn()
-        self._render_taskmgr_cards(force=False)
+        jobs = load_jobs()
+        if jobs:
+            self._patch_taskmgr_cards([j.id for j in jobs], reorder=False)
         if self._manual_folder_advance_mode:
-            info("手动下一天：请点击要切换的文件夹任务卡片")
+            info_i18n("log.manual_day_mode_on")
         else:
-            info("已退出手动下一天模式")
+            info_i18n("log.manual_day_mode_off")
 
     def _manual_advance_folder_day_by_id(self, job_id: str) -> None:
         if self._taskmgr_toggle_busy:
@@ -2612,57 +2913,57 @@ class MainWindow(ctk.CTkFrame):
         if j is None:
             return
         if not is_folder_job(j):
-            messagebox.showinfo("手动下一天", "仅文件夹任务可手动切换下一天。", parent=self)
+            msg_info(self, "msgbox.manual_day.title", "msgbox.manual_day.folder_only")
             return
         if not can_advance_folder_day(j):
-            messagebox.showinfo(
-                "手动下一天",
-                "该任务已是最后一天，无下一天可切换。\n"
-                "可点「一键开始下一天」自动删除此类卡片。",
-                parent=self,
-            )
+            msg_info(self, "msgbox.manual_day.title", "msgbox.manual_day.last_day")
             return
         nxt = j.folder_day_index + 1
-        msg = (
-            f"将中断当前天未发完的内容。\n\n"
-            f"目标：{self._job_target_short(j)}\n"
-            f"{j.source_name or '未命名'} → {j.folder_files[nxt]}\n"
-            f"（第 {nxt + 1}/{len(j.folder_files)} 天）\n\n确定继续？"
-        )
-        if not messagebox.askyesno("手动下一天", msg, parent=self):
+        unnamed = t("grp.unnamed")
+        if not msg_askyesno(
+            self,
+            "msgbox.manual_day.title",
+            "msgbox.manual_day.confirm",
+            target=self._job_target_short(j),
+            current=j.source_name or unnamed,
+            next_file=j.folder_files[nxt],
+            day=nxt + 1,
+            total=len(j.folder_files),
+        ):
             return
         self._cfg = load_config()
         ok, err = advance_scheduled_folder_day(j, self._cfg)
         if not ok:
-            info(f"切换失败：{err}")
+            info_i18n("log.folder_advance_fail", err=err)
             return
         save_jobs_patch([j])
         apply_last_schedule_for_jobs(self._cfg, [j])
-        self._render_taskmgr_cards(force=True)
-        info(f"已切换：{self._job_target_short(j)} → 第 {j.folder_day_index + 1} 天")
+        self._refresh_taskmgr_card(j.id)
+        info_i18n(
+            "log.folder_advance_ok",
+            target=self._job_target_short(j),
+            day=j.folder_day_index + 1,
+        )
 
     def _start_next_folder_day(self) -> None:
         jobs = load_jobs()
         candidates, stale = split_folder_jobs_for_bulk_advance(jobs)
         if not candidates and not stale:
             try:
-                messagebox.showinfo(
-                    "一键开始下一天",
-                    "没有文件夹任务可处理（需为文件夹任务）。",
-                    parent=self,
-                )
+                msg_info(self, "msgbox.next_day.title", "msgbox.next_day.no_folder")
             except Exception:
-                info("没有可处理的文件夹任务。")
+                info_i18n("log.next_day_no_folder")
             return
 
         lines: List[str] = []
         running_n = 0
+        unnamed = t("grp.unnamed")
         for j in candidates:
             nxt = j.folder_day_index + 1
             lines.append(
                 format_folder_advance_line(
                     target_label=self._job_target_short(j),
-                    current_name=j.source_name or "未命名",
+                    current_name=j.source_name or unnamed,
                     next_name=j.folder_files[nxt],
                     next_day_one_based=nxt + 1,
                     total_days=len(j.folder_files),
@@ -2677,32 +2978,30 @@ class MainWindow(ctk.CTkFrame):
             del_lines.append(
                 format_folder_last_day_delete_line(
                     target_label=self._job_target_short(j),
-                    current_name=j.source_name or "未命名",
+                    current_name=j.source_name or unnamed,
                     day_one_based=idx + 1,
                     total_days=len(j.folder_files),
                 )
             )
 
-        msg = ""
+        body_kwargs: Dict[str, Any] = {"advance_block": "", "delete_block": ""}
         if candidates:
-            msg += "将中断当前天未发完的内容。\n\n"
+            advance_intro = t("msgbox.next_day.interrupt")
             if running_n:
-                msg += f"其中 {running_n} 个任务正在运行，切换后会立即停止当前天。\n\n"
-            msg += (
-                f"将为以下文件夹任务切换到下一天并开始发送"
-                f"（每批 {FOLDER_BULK_ADVANCE_BATCH_SIZE} 个，批间暂停 {int(FOLDER_BULK_ADVANCE_BATCH_PAUSE_SEC)} 秒）：\n"
-            )
-            msg += "\n".join(lines)
+                advance_intro += "\n\n" + t("msgbox.next_day.running", n=running_n)
+            advance_intro += "\n\n" + t("msgbox.next_day.advance_list") + "\n" + "\n".join(lines)
+            body_kwargs["advance_block"] = advance_intro
         if stale:
-            if msg:
-                msg += "\n\n"
-            msg += "以下任务已是最后一天，将删除卡片：\n"
-            msg += "\n".join(del_lines)
-        msg += "\n\n确定继续？"
+            delete_block = t("msgbox.next_day.delete_list") + "\n" + "\n".join(del_lines)
+            if body_kwargs["advance_block"]:
+                body_kwargs["delete_block"] = "\n\n" + delete_block
+            else:
+                body_kwargs["delete_block"] = delete_block
         try:
-            if not messagebox.askyesno("一键开始下一天", msg, parent=self):
+            if not msg_askyesno(self, "msgbox.next_day.title", "msgbox.next_day.body", **body_kwargs):
                 return
-        except Exception:
+        except Exception as exc:
+            error(f"一键开始下一天确认框失败: {exc}")
             return
 
         self._cfg = load_config()
@@ -2712,7 +3011,7 @@ class MainWindow(ctk.CTkFrame):
         self._bulk_folder_advance_failed = 0
         total = len(self._bulk_folder_advance_ids)
         if total:
-            info(f"一键下一天：共 {total} 个任务，每批 {FOLDER_BULK_ADVANCE_BATCH_SIZE} 个…")
+            info_i18n("log.next_day_batch", total=total, batch=FOLDER_BULK_ADVANCE_BATCH_SIZE)
         self._run_bulk_folder_advance_batch()
 
     def _run_bulk_folder_advance_batch(self) -> None:
@@ -2736,7 +3035,7 @@ class MainWindow(ctk.CTkFrame):
                 self._bulk_folder_advance_done += 1
             else:
                 self._bulk_folder_advance_failed += 1
-                info(f"任务 {self._job_target_short(live)} 切换失败：{err}")
+                info_i18n("log.folder_advance_job_fail", target=self._job_target_short(live), err=err)
 
         if batch_updated:
             apply_last_schedule_for_jobs(self._cfg, batch_updated)
@@ -2744,9 +3043,11 @@ class MainWindow(ctk.CTkFrame):
 
         remaining = len(self._bulk_folder_advance_ids)
         if remaining:
-            info(
-                f"本批已切换 {len(batch_updated)} 个，"
-                f"累计 {self._bulk_folder_advance_done} 个，剩余 {remaining} 个…"
+            info_i18n(
+                "log.bulk_advance_batch",
+                batch=len(batch_updated),
+                done=self._bulk_folder_advance_done,
+                remaining=remaining,
             )
             self.after(
                 int(FOLDER_BULK_ADVANCE_BATCH_PAUSE_SEC * 1000),
@@ -2770,18 +3071,19 @@ class MainWindow(ctk.CTkFrame):
         self._bulk_folder_advance_stale_ids = set()
 
         if done == 0 and failed == 0 and not stale_ids:
-            info("未能切换或删除任何文件夹任务。")
+            info_i18n("log.next_day_nothing")
             return
 
         self._render_taskmgr_cards(force=True)
         parts: List[str] = []
         if done:
-            parts.append(f"已切换 {done} 个任务到下一天")
+            parts.append(t("log.next_day_advanced", n=done))
         if failed:
-            parts.append(f"{failed} 个切换失败")
+            parts.append(t("log.next_day_failed", n=failed))
         if stale_ids:
-            parts.append(f"已删除 {len(stale_ids)} 个无下一天的任务")
-        info("；".join(parts) + "。")
+            parts.append(t("log.next_day_deleted", n=len(stale_ids)))
+        if parts:
+            info(t("log.next_day_summary", summary="；".join(parts)))
 
     def _sched_job_fingerprint(self, j: ScheduledJob) -> tuple:
         stotal, sdone, sremain = j.send_progress()
@@ -2804,19 +3106,20 @@ class MainWindow(ctk.CTkFrame):
 
     def _job_detail_text(self, j: ScheduledJob) -> str:
         if not j.enabled:
-            status = "已停用"
+            status = t("dash.disabled")
         elif j.state == "paused":
-            status = f"暂停（{j.pause_reason or '手动'}）"
+            reason = display_pause_reason(j.pause_reason or CODE_MANUAL)
+            status = t("job_card.paused_paren", reason=reason)
         else:
-            status = "运行中"
+            status = t("job_card.running")
         emap = {e.id: e for e in self._cfg.address_book}
         if j.chat_entry_ids:
             names = [emap[eid].remark.strip() or emap[eid].id for eid in j.chat_entry_ids if eid in emap]
-            tgt_desc = "、".join(names) if names else f"{len(j.chat_entry_ids)} 个目标"
+            tgt_desc = "、".join(names) if names else t("sched.target_count", n=len(j.chat_entry_ids))
         elif j.chat_ids:
-            tgt_desc = f"{len(j.chat_ids)} 个群(ID)"
+            tgt_desc = t("sched.target_chat_ids", n=len(j.chat_ids))
         else:
-            tgt_desc = "未设群"
+            tgt_desc = t("job_target.unset")
         delay_hint = ""
         if j.interval_mode == "txt" or items_use_txt_intervals(j.items):
             delays = [
@@ -2825,15 +3128,25 @@ class MainWindow(ctk.CTkFrame):
                 if not it.is_reminder and getattr(it, "interval_from_txt", False)
             ]
             if delays:
-                delay_hint = f" · 间隔 TXT {min(delays):g}–{max(delays):g} 分/条"
+                delay_hint = t("sched.delay.txt", min_v=min(delays), max_v=max(delays))
         elif j.interval_mode == "mixed" or items_have_any_txt_interval(j.items):
-            delay_hint = f" · 间隔 TXT优先 + 固定 {j.interval_min_minutes:g}-{j.interval_max_minutes:g} 分"
+            delay_hint = t(
+                "sched.delay.txt_mixed",
+                min_v=j.interval_min_minutes,
+                max_v=j.interval_max_minutes,
+            )
         elif j.interval_max_minutes > 0 or j.interval_min_minutes > 0:
-            delay_hint = f" · 间隔固定 {j.interval_min_minutes:g}-{j.interval_max_minutes:g} 分"
+            delay_hint = t(
+                "sched.delay.fixed",
+                min_v=j.interval_min_minutes,
+                max_v=j.interval_max_minutes,
+            )
         oc = Counter(it.original_label() for it in j.items if not it.is_reminder and it.original_label())
         dist = ""
         if oc:
-            dist = " · 原文：" + "、".join(f"{k}×{v}" for k, v in sorted(oc.items()))
+            dist = t("sched.orig_prefix") + "、".join(
+                t("sched.orig_item", k=k, v=v) for k, v in sorted(oc.items())
+            )
         main_mapped = next(
             (
                 it.effective_send_account_id()
@@ -2845,10 +3158,21 @@ class MainWindow(ctk.CTkFrame):
             None,
         )
         if main_mapped:
-            dist += f" · 主号→{main_mapped}"
+            dist += t("sched.main_mapped", acc=main_mapped)
         stotal, sdone, sremain = j.send_progress()
         prog = self._format_send_progress(stotal, sdone, sremain, step_total=j.item_count())
-        return f"{tgt_desc} · 文档 {j.source_name} · {prog}{delay_hint}{dist} · 状态：{status}"
+        note = operator_note_for_items(j.items, cursor=int(j.cursor or 0), max_len=40)
+        note_part = t("sched.job_note", text=note) if note else ""
+        return t(
+            "sched.job_detail",
+            tgt=tgt_desc,
+            name=j.source_name,
+            prog=prog,
+            delay=delay_hint,
+            dist=dist,
+            status=status,
+            note=note_part,
+        )
 
     def _create_sched_job_row(self, j: ScheduledJob) -> None:
         row = ctk.CTkFrame(self._job_rows, fg_color=COLORS["card"], corner_radius=10, border_width=1, border_color=COLORS["border"])
@@ -2865,27 +3189,27 @@ class MainWindow(ctk.CTkFrame):
         acts.pack(fill="x", padx=12, pady=(0, 10))
         btn_run = ctk.CTkButton(
             acts,
-            text=("继续" if j.state == "paused" else "暂停"),
+            text=(t("taskmgr.hint_resume") if j.state == "paused" else t("taskmgr.hint_pause")),
             fg_color=COLORS["border"],
             command=lambda jid=j.id: self._toggle_job_run_by_id(jid),
         )
         btn_run.pack(fill="x", pady=2)
         btn_en = ctk.CTkButton(
             acts,
-            text=("停用" if j.enabled else "启用"),
+            text=(t("dash.disabled") if j.enabled else t("dash.enabled")),
             fg_color=COLORS["border"],
             command=lambda jid=j.id: self._toggle_job_enabled_by_id(jid),
         )
         btn_en.pack(fill="x", pady=2)
         ctk.CTkButton(
             acts,
-            text="选为编辑",
+            text=t("sched.select_edit"),
             fg_color=COLORS["border"],
             command=lambda jid=j.id: self._select_sched_job_for_edit(jid),
         ).pack(fill="x", pady=2)
         ctk.CTkButton(
             acts,
-            text="删除",
+            text=t("common.delete"),
             fg_color=COLORS["danger"],
             command=lambda jid=j.id: self._del_job_by_id(jid),
         ).pack(fill="x", pady=2)
@@ -2898,7 +3222,7 @@ class MainWindow(ctk.CTkFrame):
         self._sched_job_row_widgets.clear()
         self._sched_job_fingerprints.clear()
         if not jobs:
-            ctk.CTkLabel(self._job_rows, text="尚未添加任务。", text_color=COLORS["muted"]).pack(anchor="w", pady=8)
+            ctk.CTkLabel(self._job_rows, text=t("sched.no_jobs"), text_color=COLORS["muted"]).pack(anchor="w", pady=8)
             return
         for j in jobs:
             self._create_sched_job_row(j)
@@ -2917,8 +3241,12 @@ class MainWindow(ctk.CTkFrame):
             if not w:
                 continue
             w["detail"].configure(text=self._job_detail_text(j))
-            w["btn_run"].configure(text=("继续" if j.state == "paused" else "暂停"))
-            w["btn_en"].configure(text=("停用" if j.enabled else "启用"))
+            w["btn_run"].configure(
+                text=(t("sched.btn_resume") if j.state == "paused" else t("sched.btn_pause"))
+            )
+            w["btn_en"].configure(
+                text=(t("sched.btn_disable") if j.enabled else t("sched.btn_enable"))
+            )
 
     def _render_jobs(self, *, full: Optional[bool] = None) -> None:
         if getattr(self, "_job_rows", None) is None:
@@ -2948,18 +3276,22 @@ class MainWindow(ctk.CTkFrame):
             if names:
                 s = "、".join(names)
                 if len(j.chat_entry_ids) > 4:
-                    s += f"等{len(j.chat_entry_ids)}群"
+                    s += t("sched.target_more_groups", n=len(j.chat_entry_ids))
                 return s
         if j.chat_ids:
             if len(j.chat_ids) == 1:
-                return f"群{j.chat_ids[0]}"
-            return f"{len(j.chat_ids)}个群ID"
-        return "未设群"
+                return t("sched.single_group_id", id=j.chat_ids[0])
+            return t("sched.multi_group_ids", n=len(j.chat_ids))
+        return t("job_target.unset")
 
     def _sched_job_label(self, j: ScheduledJob) -> str:
-        return (
-            f"{self._job_target_short(j)}{schedule_kind_badge(j)} · "
-            f"{j.source_name} · {j.item_count()}步 · #{j.id[:8]}"
+        return t(
+            "sched.job_label",
+            target=self._job_target_short(j),
+            badge=schedule_kind_badge(j),
+            name=j.source_name,
+            steps=j.item_count(),
+            jid=j.id[:8],
         )
 
     def _on_sched_job_pick_changed(self, _value: str) -> None:
@@ -3040,34 +3372,36 @@ class MainWindow(ctk.CTkFrame):
         self._sync_sched_job_pick_combo()
         job = next((j for j in load_jobs() if j.id == job_id), None)
         if job:
-            info(
-                f"已选定任务 #{job.id[:8]} · 目标={self._job_target_short(job)} · {job.source_name}；"
-                "批量替换仅影响本任务，不影响其他任务。"
+            info_i18n(
+                "sched.selected_job_hint",
+                jid=job.id[:8],
+                target=self._job_target_short(job),
+                name=job.source_name,
             )
         else:
-            info("已选定该任务，可在上方批量替换发送账号。")
+            info_i18n("log.job_selected_for_edit")
 
     def _schedule_bulk_replace_by_original(self) -> None:
         jid = (self._sched_edit_job_id or "").strip()
         if not jid:
-            info("请先在任务列表点「选为编辑」，或在下拉框选定任务（请看名称里的群与 #编号）。")
+            info_i18n("log.bulk_need_pick")
             return
         jobs = load_jobs()
         job = next((j for j in jobs if j.id == jid), None)
         if job is None:
-            info("选定任务不存在，请重新选择。")
+            info_i18n("log.bulk_job_missing")
             return
         from_acc = self._sched_bulk_from_combo.get().strip()
         to_acc = self._sched_bulk_to_combo.get().strip()
         if from_acc in ("", "—") or not to_acc:
-            info("请先选择「原文账号」与「改为由…发送」。")
+            info_i18n("log.bulk_from_to")
             return
         if from_acc == to_acc:
-            info("原文账号与目标发送账号相同，无需替换。")
+            info_i18n("log.bulk_same")
             return
         valid = {a.id for a in self._cfg.accounts}
         if valid and to_acc not in valid:
-            info(f"目标账号「{to_acc}」未在账号管理中添加。")
+            info_i18n("log.bulk_target_missing", account=to_acc)
             return
         n = 0
         for it in job.items:
@@ -3077,15 +3411,12 @@ class MainWindow(ctk.CTkFrame):
                 it.send_as_account_id = to_acc
                 n += 1
         if n == 0:
-            info(f"没有原文为「{from_acc}」的发送条目（提醒步不计入）。")
+            info_i18n("log.bulk_no_from", account=from_acc)
             return
         save_jobs_patch([job])
         self._refresh_sched_bulk_combos(job)
-        self._render_taskmgr_cards()
-        info(
-            f"仅任务 #{job.id[:8]}（目标={self._job_target_short(job)} · {job.source_name}）："
-            f"已将原文「{from_acc}」的 {n} 条改为由「{to_acc}」发送；其他任务未改动。"
-        )
+        self._refresh_taskmgr_card(job.id)
+        info_i18n("log.bulk_replaced", from_acc=from_acc, n=n, to_acc=to_acc)
 
     def _toggle_job_run_by_id(self, job_id: str) -> None:
         if self._taskmgr_toggle_busy:
@@ -3096,11 +3427,11 @@ class MainWindow(ctk.CTkFrame):
             if j is None:
                 return
             if self._doc_job_is_running(j):
-                self._scheduler.pause_job(j.id, "手动暂停")
+                self._scheduler.pause_job(j.id, CODE_MANUAL)
             elif self._scheduler.resume_job(j.id):
                 self._warn_if_tg_session_down()
             else:
-                info("无法启动该任务")
+                info_i18n("log.cannot_start_job")
             self._refresh_job_run_ui(job_id)
         finally:
             self._taskmgr_toggle_busy = False
@@ -3111,7 +3442,7 @@ class MainWindow(ctk.CTkFrame):
             return
         job.enabled = not job.enabled
         if job.enabled and job.state == "paused":
-            job.pause_reason = job.pause_reason or "手动暂停"
+            job.pause_reason = job.pause_reason or CODE_MANUAL
         save_jobs_patch([job])
         self._refresh_job_run_ui(job_id)
 
@@ -3120,11 +3451,14 @@ class MainWindow(ctk.CTkFrame):
         dead = next((j for j in jobs if j.id == job_id), None)
         if dead is None:
             return
+        target = self._job_target_short(dead)
+        if not msg_askyesno(self, "msgbox.delete.title", "msgbox.delete.body", name=dead.source_name, target=target):
+            return
         jobs = [j for j in jobs if j.id != job_id]
         if dead.id == self._sched_edit_job_id:
             self._sched_edit_job_id = None
         save_jobs(jobs)
-        info(f"已删除任务：{dead.source_name}")
+        info_i18n("log.job_deleted", name=dead.source_name)
         self._render_taskmgr_cards(force=True)
         self._sync_sched_job_pick_combo()
         if getattr(self, "_sched_targets", None) is not None:
@@ -3133,13 +3467,13 @@ class MainWindow(ctk.CTkFrame):
     def _delete_all_jobs(self) -> None:
         jobs = load_jobs()
         if not jobs:
-            info("当前没有可删除的任务。")
+            info_i18n("log.delete_all_none")
             return
         single_txt, folder_done, folder_kept, to_delete, kept = bulk_delete_job_summary(jobs)
         if not to_delete:
-            info("没有可批量删除的任务（仅删除单 TXT，或文件夹任务全部天数已发完）。")
+            info_i18n("log.delete_all_nothing")
             if folder_kept > 0:
-                info(f"保留 {folder_kept} 个进行中的文件夹任务。")
+                info_i18n("log.delete_all_kept_folder", n=folder_kept)
             return
         msg = format_bulk_delete_confirm_message(
             single_txt=single_txt,
@@ -3147,7 +3481,7 @@ class MainWindow(ctk.CTkFrame):
             folder_kept=folder_kept,
             total_delete=len(to_delete),
         )
-        if not messagebox.askyesno("一键删除任务", msg, parent=self):
+        if not ask_yes_no(self, t("msgbox.delete_all.title"), msg):
             return
         save_jobs(kept)
         deleted_ids = {j.id for j in to_delete}
@@ -3159,13 +3493,20 @@ class MainWindow(ctk.CTkFrame):
         if getattr(self, "_sched_targets", None) is not None:
             self._refresh_schedule_target_checks()
         if folder_kept > 0:
-            info(
-                f"已删除 {len(to_delete)} 个任务"
-                f"（单 TXT {single_txt}，已完成文件夹 {folder_done}），"
-                f"保留 {folder_kept} 个进行中的文件夹任务。"
+            info_i18n(
+                "log.delete_all_done_kept",
+                n=len(to_delete),
+                single_txt=single_txt,
+                folder_done=folder_done,
+                folder_kept=folder_kept,
             )
         else:
-            info(f"已删除 {len(to_delete)} 个任务（单 TXT {single_txt}，已完成文件夹 {folder_done}）。")
+            info_i18n(
+                "log.delete_all_done",
+                n=len(to_delete),
+                single_txt=single_txt,
+                folder_done=folder_done,
+            )
 
     def _page_logs(self) -> ctk.CTkFrame:
         page = ctk.CTkFrame(self._content, fg_color="transparent")
@@ -3173,10 +3514,10 @@ class MainWindow(ctk.CTkFrame):
         log_foot = ctk.CTkFrame(page, fg_color=COLORS["card"], corner_radius=12, border_width=1, border_color=COLORS["border"])
         lf = ctk.CTkFrame(log_foot, fg_color="transparent")
         lf.pack(fill="x", padx=12, pady=10)
-        ctk.CTkButton(lf, text="刷新日志", command=self._flush_logs_ui, fg_color=COLORS["accent"]).pack(fill="x")
+        ctk.CTkButton(lf, text=t("common.refresh_logs"), command=self._flush_logs_ui, fg_color=COLORS["accent"]).pack(fill="x")
 
         wrap, finish_scroll = self._mount_main_scroll(page, footer=log_foot)
-        ctk.CTkLabel(wrap, text="日志中心", font=ctk.CTkFont(size=22, weight="bold"), text_color=COLORS["text"]).pack(anchor="w", pady=(8, 12))
+        ctk.CTkLabel(wrap, text=t("nav.logs_tg"), font=ctk.CTkFont(size=22, weight="bold"), text_color=COLORS["text"]).pack(anchor="w", pady=(8, 12))
 
         self._log_box = ctk.CTkTextbox(
             wrap,
@@ -3191,7 +3532,7 @@ class MainWindow(ctk.CTkFrame):
         bind_log_textbox_wheel(self._log_box)
         reload_log_textbox_from_memory(
             self._log_box,
-            get_recent_lines,
+            self._tg_log_lines,
             limit=LOG_TEXTBOX_MAX_LINES,
             log_queue=getattr(self, "_log_ui_queue", None),
         )
@@ -3205,7 +3546,7 @@ class MainWindow(ctk.CTkFrame):
             return
         reload_log_textbox_from_memory(
             lb,
-            get_recent_lines,
+            self._tg_log_lines,
             limit=LOG_TEXTBOX_MAX_LINES,
             max_lines=LOG_TEXTBOX_MAX_LINES,
             log_queue=getattr(self, "_log_ui_queue", None),
@@ -3213,7 +3554,7 @@ class MainWindow(ctk.CTkFrame):
 
     def _save_all_and_restart(self) -> None:
         if not getattr(self, "_pages_ready", False):
-            info("界面仍在加载，请稍候再点「保存并重载服务」。")
+            info_i18n("log.ui_save_loading")
             return
         self._optional_merge_global_api_from_ui()
         try:
@@ -3221,19 +3562,21 @@ class MainWindow(ctk.CTkFrame):
                 self._cfg.rate_limit_seconds = float(self._rate_entry.get().strip())
         except Exception:
             pass
+        if getattr(self, "_stage_popup_var", None) is not None:
+            self._cfg.stage_reminder_popup_enabled = bool(self._stage_popup_var.get())
         save_config(self._cfg)
         save_jobs(load_jobs())
-        info("配置已写入 config.json")
+        info_i18n("log.config_saved")
 
         def after_restart() -> None:
             self._render_account_rows()
             self._render_group_rows(force=True)
             self._refresh_schedule_combo()
             self._refresh_schedule_target_checks()
-            self._render_taskmgr_cards()
+            self._sync_taskmgr_page()
             self._refresh_dashboard()
             self._schedule_login_probe()
-            info("服务已根据配置重启")
+            info_i18n("log.tg_services_restarted")
 
         self._invoke_restart_in_background(after_restart)
 

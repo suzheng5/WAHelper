@@ -1,4 +1,4 @@
-"""定时任务：本条消息发送后的延迟文字点赞（排除发送账号，其余角色随机 1–2 人）。"""
+"""定时任务：本条消息发送后的延迟表情点赞（排除发送账号，其余角色随机 1–2 人）。"""
 from __future__ import annotations
 
 import asyncio
@@ -11,12 +11,15 @@ def _tg_log():
 
     return debug, error, info, warning
 
-REACTION_ROLE_LABELS: Tuple[str, ...] = ("女一", "女二", "男二", "主号")
+
 _HEART = "❤️"
 _THUMBS = "👍"
 _REACTION_DELAY_MIN_SEC = 60.0
 _REACTION_DELAY_MAX_SEC = 600.0
 _PENDING_REACTION_TASKS: Set[asyncio.Task[Any]] = set()
+
+# 兼容旧测试/导入名（逻辑已改为按账号简称含「女」「男」匹配）
+REACTION_ROLE_LABELS: Tuple[str, ...] = ("女一", "女二", "男二", "主号")
 
 
 def reaction_delay_seconds() -> float:
@@ -24,10 +27,30 @@ def reaction_delay_seconds() -> float:
     return random.uniform(_REACTION_DELAY_MIN_SEC, _REACTION_DELAY_MAX_SEC)
 
 
-def reaction_emoji_for_role_label(label: str) -> str:
-    if (label or "").strip() == "男二":
+def reaction_emoji_for_account(account_id: str, *, is_main: bool = False) -> str:
+    """主号与带「女」的简称 → 爱心；带「男」的简称 → 拇指。"""
+    if is_main:
+        return _HEART
+    aid = (account_id or "").strip()
+    if "男" in aid:
         return _THUMBS
     return _HEART
+
+
+def reaction_emoji_for_role_label(label: str) -> str:
+    """兼容旧接口：仅「男*」为拇指，其余爱心；「主号」为爱心。"""
+    lab = (label or "").strip()
+    if lab == "主号":
+        return _HEART
+    return reaction_emoji_for_account(lab, is_main=False)
+
+
+def _account_is_female_like(account_id: str) -> bool:
+    return "女" in (account_id or "")
+
+
+def _account_is_male_like(account_id: str) -> bool:
+    return "男" in (account_id or "")
 
 
 def pick_reaction_accounts(
@@ -36,18 +59,33 @@ def pick_reaction_accounts(
     main_account_id: str,
     available_account_ids: Set[str],
 ) -> List[Tuple[str, str]]:
-    """从四角色池中排除发送账号，再随机 1–2 人点赞。返回 (角色名, 账号简称)。"""
+    """
+    点赞池：主号 + 简称含「女」或「男」的启用账号；排除本条发送账号。
+    返回 (角色标签, 账号简称)；主号槽标签固定为「主号」（爱心）。
+    """
     sender = (sender_account_id or "").strip()
     main = (main_account_id or "").strip()
+    avail = {(a or "").strip() for a in available_account_ids if (a or "").strip()}
     pool: List[Tuple[str, str]] = []
-    for label in REACTION_ROLE_LABELS:
-        acc = main if label == "主号" else label
-        acc = (acc or "").strip()
-        if not acc or acc == sender:
+    seen: Set[str] = set()
+
+    def _add(label: str, acc: str) -> None:
+        a = (acc or "").strip()
+        if not a or a == sender or a not in avail or a in seen:
+            return
+        seen.add(a)
+        pool.append((label, a))
+
+    # 主号（可对应该群当前归属账号，切换批超群号后仍用通讯录 owner）
+    if main:
+        _add("主号", main)
+
+    for acc in sorted(avail):
+        if acc in seen or acc == sender:
             continue
-        if acc not in available_account_ids:
-            continue
-        pool.append((label, acc))
+        if _account_is_female_like(acc) or _account_is_male_like(acc):
+            _add(acc, acc)
+
     if not pool:
         return []
     count = random.randint(1, min(2, len(pool)))
@@ -104,7 +142,7 @@ async def _run_telegram_reaction_delayed(
     delay_sec: float,
 ) -> None:
     _debug, _error, _info, _warning = _tg_log()
-    emoji = reaction_emoji_for_role_label(label)
+    emoji = reaction_emoji_for_account(acc_id, is_main=(label == "主号"))
     try:
         await asyncio.sleep(delay_sec)
         client = shared_clients.get(acc_id)
@@ -119,13 +157,21 @@ async def _run_telegram_reaction_delayed(
             if not await client.is_user_authorized():
                 _warning(f"[TG] 定时点赞跳过：账号 {acc_id} 未登录（延迟后）")
                 return
+            try:
+                from tg_multi_listener.group_auto_join import is_account_in_group
+
+                if not await is_account_in_group(client, chat_ref):
+                    _debug(f"[TG] 定时点赞跳过：账号 {acc_id} 不在群内")
+                    return
+            except Exception:
+                pass
             entity = await _resolve_telegram_entity_for_send(client, chat_ref)
             await telegram_react_once(client, entity, msg_id, emoji)
         _info(f"[TG] 定时点赞完成：账号={acc_id} 表情={emoji} 延迟={delay_sec / 60:.1f} 分钟")
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        _error(f"[TG] 定时点赞失败：账号={acc_id} 表情={emoji} 错误={exc}")
+        _warning(f"[TG] 定时点赞失败：账号={acc_id} 表情={emoji} 错误={exc}")
 
 
 def schedule_telegram_reactions(
@@ -146,7 +192,11 @@ def schedule_telegram_reactions(
         available_account_ids=enabled_account_ids,
     )
     if not reactors:
-        _debug("[TG] 定时点赞跳过：无可用点赞账号")
+        _warning(
+            "[TG] 定时点赞跳过：无可用点赞账号"
+            f"（发送={sender_account_id!r} 主号={main_account_id!r} "
+            f"启用={sorted(enabled_account_ids)}；需有主号或简称含「女」「男」）"
+        )
         return 0
     scheduled = 0
     for label, acc_id in reactors:
@@ -167,10 +217,6 @@ def schedule_telegram_reactions(
         )
         _track_reaction_task(task)
         scheduled += 1
-        _info(
-            f"[TG] 定时点赞已排程：账号={acc_id} 表情={reaction_emoji_for_role_label(label)} "
-            f"约 {delay_sec / 60:.1f} 分钟后"
-        )
     return scheduled
 
 
@@ -199,4 +245,13 @@ def resolve_main_account_for_job_target(cfg: Any, job: Any, chat_ref: Any) -> st
             owner = (getattr(ent, "owner_account_id", None) or "").strip()
             if owner:
                 return owner
+    # 文件夹/旧任务无 entry_ids：按 chat_ref 反查通讯录归属（切换批超群号后仍能点赞）
+    if ref_s:
+        for ent in getattr(cfg, "address_book", []) or []:
+            ent_ref = (getattr(ent, "chat_ref", None) or "").strip()
+            ent_id = str(getattr(ent, "chat_id", None) or "").strip()
+            if ref_s == ent_ref or ref_s == ent_id:
+                owner = (getattr(ent, "owner_account_id", None) or "").strip()
+                if owner:
+                    return owner
     return ""

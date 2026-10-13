@@ -6,6 +6,8 @@ from typing import Callable, Optional
 
 import customtkinter as ctk
 
+from i18n import t
+from wa_ui.window_policy import close_window, present_once
 from .theme import COLORS
 
 
@@ -25,7 +27,6 @@ class StringInputDialog(ctk.CTkToplevel):
         self.title(title)
         self.configure(fg_color=COLORS["bg"])
         self.geometry("440x200")
-        self.attributes("-topmost", True)
         self.resizable(False, False)
 
         frm = ctk.CTkFrame(self, fg_color=COLORS["card"], corner_radius=12, border_width=1, border_color=COLORS["border"])
@@ -49,11 +50,12 @@ class StringInputDialog(ctk.CTkToplevel):
         def cancel() -> None:
             self._finish(None)
 
-        ctk.CTkButton(btn, text="取消", width=100, fg_color=COLORS["border"], command=cancel).pack(side="right", padx=(8, 0))
-        ctk.CTkButton(btn, text="确定", width=100, fg_color=COLORS["accent"], command=ok).pack(side="right")
+        ctk.CTkButton(btn, text=t("common.cancel"), width=100, fg_color=COLORS["border"], command=cancel).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(btn, text=t("common.confirm"), width=100, fg_color=COLORS["accent"], command=ok).pack(side="right")
 
         self.protocol("WM_DELETE_WINDOW", cancel)
         self.bind("<Return>", lambda _e: ok())
+        present_once(self, parent=master, focus=True)
         try:
             self.grab_set()
         except Exception:
@@ -65,7 +67,7 @@ class StringInputDialog(ctk.CTkToplevel):
         except Exception:
             pass
         self._on_submit(value)
-        self.destroy()
+        close_window(self)
 
 
 class LoginUIBridge:

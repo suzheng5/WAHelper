@@ -87,6 +87,8 @@ class AddressEntry:
     owner_account_id: str = ""
     """该群上一次成功发出的定时任务 TXT 文件名（持久化到 config）。"""
     last_schedule_source_name: str = ""
+    """邀请链接原文：chat_ref 被解析成 @g.us 后仍保留，供其它账号自动入群。"""
+    invite_link: str = ""
 
 
 @dataclass
@@ -110,6 +112,7 @@ class AppConfig:
     address_book: List[AddressEntry] = field(default_factory=list)
     rate_limit_seconds: float = 10.0
     listening_enabled: bool = True
+    stage_reminder_popup_enabled: bool = True
 
 
 def default_config() -> AppConfig:
@@ -175,6 +178,103 @@ def resolve_job_chat_targets(cfg: AppConfig, job: Any) -> List[str]:
     return [str(x).strip() for x in raw if str(x).strip()]
 
 
+def find_wa_invite_link_for_chat_ref(cfg: "AppConfig", chat_ref: str) -> str:
+    """按群 JID / 邀请链接在通讯录中找回 invite_link。"""
+    from wa_jid import invite_code_from_link, keys_for_chat_ref
+
+    cref = (chat_ref or "").strip()
+    if not cref:
+        return ""
+    if invite_code_from_link(cref):
+        return cref
+    target = keys_for_chat_ref(cref)
+    for ent in cfg.address_book:
+        raw = (ent.chat_ref or "").strip()
+        link = (getattr(ent, "invite_link", None) or "").strip()
+        raw_keys = keys_for_chat_ref(raw) if raw else set()
+        link_keys = keys_for_chat_ref(link) if link else set()
+        same = bool(target and (target & raw_keys or target & link_keys))
+        if not same and raw.lower() != cref.lower():
+            continue
+        if invite_code_from_link(link):
+            return link
+        if invite_code_from_link(raw):
+            return raw
+    return ""
+
+
+def persist_wa_resolved_jid(
+    group_jid_key: str,
+    *,
+    invite_ref: str = "",
+    entry_id: str = "",
+) -> bool:
+    """
+    将解析到的 @g.us 写回通讯录 chat_ref；邀请链接保留到 invite_link。
+    """
+    from wa_jid import invite_code_from_link, keys_for_chat_ref
+
+    new_ref = (group_jid_key or "").strip()
+    if not new_ref:
+        return False
+    inv_ref = (invite_ref or "").strip()
+    inv_code = invite_code_from_link(inv_ref) if inv_ref else None
+    eid = (entry_id or "").strip()
+    target = keys_for_chat_ref(new_ref)
+
+    cfg = load_config()
+    changed = False
+    for ent in cfg.address_book:
+        if eid and ent.id != eid:
+            continue
+        raw = (ent.chat_ref or "").strip()
+        link = (ent.invite_link or "").strip()
+        match = False
+        if eid and ent.id == eid:
+            match = True
+        elif inv_code and (
+            invite_code_from_link(raw) == inv_code or invite_code_from_link(link) == inv_code
+        ):
+            match = True
+        elif target and keys_for_chat_ref(raw) & target:
+            match = True
+        if not match:
+            continue
+
+        src_invite = ""
+        if inv_code:
+            if "chat.whatsapp.com/" in inv_ref.lower():
+                src_invite = inv_ref
+            else:
+                src_invite = f"https://chat.whatsapp.com/{inv_code}"
+        elif invite_code_from_link(raw):
+            src_invite = raw
+        if src_invite and (ent.invite_link or "").strip() != src_invite:
+            ent.invite_link = src_invite
+            changed = True
+        if raw != new_ref:
+            ent.chat_ref = new_ref
+            changed = True
+        if eid:
+            break
+
+    if changed:
+        try:
+            save_config(cfg)
+            from logger_util import info
+
+            info(
+                f"通讯录群 JID 已写回：{new_ref}"
+                + ("（已保留邀请链接）" if inv_code else "")
+            )
+        except Exception as exc:
+            from logger_util import warning
+
+            warning(f"写回通讯录群 JID 失败：{exc}")
+            return False
+    return changed
+
+
 def _address_entry_from_dict(d: Dict[str, Any]) -> Optional[AddressEntry]:
     if not isinstance(d, dict):
         return None
@@ -189,6 +289,7 @@ def _address_entry_from_dict(d: Dict[str, Any]) -> Optional[AddressEntry]:
         listen_enabled=bool(d.get("listen_enabled", True)),
         owner_account_id=str(d.get("owner_account_id", "") or "").strip(),
         last_schedule_source_name=str(d.get("last_schedule_source_name", "") or "").strip(),
+        invite_link=str(d.get("invite_link", "") or "").strip(),
     )
 
 
@@ -361,6 +462,7 @@ def load_config() -> AppConfig:
         address_book=address_book,
         rate_limit_seconds=float(raw.get("rate_limit_seconds", 10.0)),
         listening_enabled=bool(raw.get("listening_enabled", True)),
+        stage_reminder_popup_enabled=bool(raw.get("stage_reminder_popup_enabled", True)),
     )
 
 
@@ -372,6 +474,7 @@ def save_config(cfg: AppConfig) -> None:
         "address_book": [asdict(e) for e in cfg.address_book],
         "rate_limit_seconds": cfg.rate_limit_seconds,
         "listening_enabled": cfg.listening_enabled,
+        "stage_reminder_popup_enabled": cfg.stage_reminder_popup_enabled,
     }
     tmp = CONFIG_PATH + ".tmp"
     with _lock:

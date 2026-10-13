@@ -29,6 +29,9 @@ def main() -> None:
 
     bootstrap_tg_runtime()
     bootstrap_tg_logging()
+    from i18n import init_i18n
+
+    init_i18n()
     info("应用启动")
     from tg_multi_listener.listener import ListenerController
     from tg_multi_listener.scheduler import ScheduleRunner, pause_all_doc_jobs_on_startup

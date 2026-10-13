@@ -35,6 +35,7 @@ from group_membership import (
 
 from logger_util import debug, error, info, warning
 from watch_read_tracker import WaWatchReadTracker
+from wa_message_kind import is_wa_reaction_message
 
 from wa_jid import (
     chat_keys_from_ref,
@@ -560,6 +561,10 @@ class ListenerController:
         if not jid_nonempty(chat):
             return
 
+        # 客户点赞/表情反应不当作发言，避免误触发监听暂停
+        if is_wa_reaction_message(event.Message):
+            return
+
         sender = src.Sender if jid_nonempty(src.Sender) else None
         sender_alt = src.SenderAlt if jid_nonempty(src.SenderAlt) else None
         recipient_alt = src.RecipientAlt if jid_nonempty(src.RecipientAlt) else None
@@ -605,11 +610,18 @@ class ListenerController:
 
         who = sender or sender_alt
         if who and jid_nonempty(who):
+            who_key = jid_to_key(who)
+            alts: List[JID] = []
+            for extra in (sender, sender_alt, recipient_alt):
+                if extra is not None and jid_nonempty(extra) and jid_to_key(extra) != who_key:
+                    alts.append(extra)
+            # LID 主 sender 时，手机号备用优先用于 mark_read
             self.read_tracker.record(
                 chat_key=chat_key,
                 msg_id=msg_id,
-                chat_jid=JIDToNonAD(chat),
-                sender_jid=JIDToNonAD(who),
+                chat_jid=chat,
+                sender_jid=who,
+                sender_alts=alts,
             )
 
         if not _should_notify(chat_key, msg_id, rate_seconds):

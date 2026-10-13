@@ -1,7 +1,7 @@
 """向 WhatsApp 会话发送消息。"""
 from __future__ import annotations
 
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 from neonize.aioze.client import NewAClient
 from neonize.proto.Neonize_pb2 import JID
@@ -9,7 +9,7 @@ from neonize.proto.Neonize_pb2 import JID
 from logger_util import error, warning
 from send_typing_util import whatsapp_typing_before_send
 from wa_jid import invite_code_from_link, parse_chat_ref_to_jid
-from wa_reactions import WaSentMessageMeta, canonical_sender_jid_for_reaction
+from wa_reactions import WaSentMessageMeta, sender_jids_for_reaction
 
 
 async def resolve_chat_jid(client: NewAClient, chat_ref: Union[str, int]) -> JID:
@@ -21,26 +21,60 @@ async def resolve_chat_jid(client: NewAClient, chat_ref: Union[str, int]) -> JID
     return parse_chat_ref_to_jid(ref)
 
 
+async def send_image_to_chat(
+    client: NewAClient,
+    chat_ref: Union[str, int],
+    image_path: str,
+    *,
+    caption: str = "",
+) -> bool:
+    """向单个会话发送图片；caption 默认可空。"""
+    cref = str(chat_ref).strip()
+    path = (image_path or "").strip()
+    if not path:
+        return False
+    try:
+        jid = await resolve_chat_jid(client, cref)
+        cap = (caption or "").strip() or None
+        await client.send_image(jid, path, caption=cap)
+        return True
+    except Exception as exc:
+        error(f"发送图片失败：群={cref} 错误={exc}")
+        return False
+
+
 async def send_text_to_chat(
-    client: NewAClient, chat_ref: Union[str, int], text: str
+    client: NewAClient,
+    chat_ref: Union[str, int],
+    text: str,
+    *,
+    abort_check: Optional[Callable[[], bool]] = None,
 ) -> tuple[bool, Optional[WaSentMessageMeta]]:
     """向单个会话发送文字；成功时返回消息元数据（供延迟点赞）。"""
     cref = str(chat_ref).strip()
     try:
         jid = await resolve_chat_jid(client, cref)
-        await whatsapp_typing_before_send(client, jid, text)
+        if abort_check and abort_check():
+            return False, None
+        if not await whatsapp_typing_before_send(client, jid, text, abort_check=abort_check):
+            return False, None
+        if abort_check and abort_check():
+            return False, None
         resp = await client.send_message(jid, text)
         message_id = str(getattr(resp, "ID", None) or "").strip()
-        sender_jid = await canonical_sender_jid_for_reaction(client)
-        if not message_id or sender_jid is None:
+        sender_jids = await sender_jids_for_reaction(client)
+        if not message_id or not sender_jids:
             if not message_id:
                 warning(f"[WA] 发送成功但未拿到 message_id，无法排程点赞：目标={cref}")
+            elif not sender_jids:
+                warning(f"[WA] 发送成功但未拿到发送者 JID，无法排程点赞：目标={cref}")
             return True, None
         return True, WaSentMessageMeta(
             chat_ref=cref,
             chat_jid=jid,
             message_id=message_id,
-            message_sender_jid=sender_jid,
+            message_sender_jid=sender_jids[0],
+            message_sender_jids=sender_jids,
         )
     except Exception as exc:
         error(f"发送失败：目标={cref} 错误={exc}")

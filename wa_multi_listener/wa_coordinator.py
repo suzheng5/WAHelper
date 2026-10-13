@@ -30,7 +30,7 @@ from schedule2_runner import Schedule2Runner, load_schedule2_jobs
 
 from session_check import has_saved_session
 
-from wa_client import establish_connection, new_client, stop_all_clients
+from wa_client import establish_connection, new_client, release_wa_client, stop_all_clients
 
 
 
@@ -70,6 +70,9 @@ class WaCoordinator:
         self._pending_listen_cfg: Optional[AppConfig] = None
 
         self._session_id: int = 0
+
+        # 扫码登录中的账号：批量/自动连接须跳过，避免抢同一会话库
+        self._login_hold_ids: Set[str] = set()
 
 
 
@@ -153,10 +156,13 @@ class WaCoordinator:
             resolved = await resolve_invite_ref(client, cr, log_label="通讯录")
 
             if resolved and resolved != cr:
-
+                if not (ent.invite_link or "").strip():
+                    ent.invite_link = cr
                 ent.chat_ref = resolved
-
                 changed = True
+                info(
+                    f"通讯录「{ent.remark or ent.id}」群已解析为 {resolved}（已保留邀请链接）"
+                )
 
         if changed:
 
@@ -263,8 +269,22 @@ class WaCoordinator:
 
 
 
-    def prepare_for_login(self, account_id: str, timeout: float = 25.0) -> None:
-        """登录前仅断开待登录账号，其它账号保持在线。"""
+    def begin_login_hold(self, account_id: str) -> None:
+        """标记账号正在扫码登录（其它账号连接过程中也可登录）。"""
+        with self._lock:
+            self._login_hold_ids.add(account_id)
+
+    def release_login_hold(self, account_id: str) -> None:
+        with self._lock:
+            self._login_hold_ids.discard(account_id)
+
+    def is_login_hold(self, account_id: str) -> bool:
+        with self._lock:
+            return account_id in self._login_hold_ids
+
+    def prepare_for_login(self, account_id: str, timeout: float = 18.0) -> None:
+        """登录前仅断开待登录账号，其它账号保持在线；给足时间释放会话库句柄。"""
+        self.begin_login_hold(account_id)
         loop = self._loop
         if loop is None or not loop.is_running():
             return
@@ -272,12 +292,13 @@ class WaCoordinator:
             fut = asyncio.run_coroutine_threadsafe(
                 self._disconnect_account_only(account_id), loop
             )
-            fut.result(timeout=max(1.0, timeout))
+            fut.result(timeout=max(5.0, timeout))
         except Exception as exc:
-            warning(f"登录前断开账号「{account_id}」时：{exc}")
+            warning(f"登录前断开账号「{account_id}」时：{exc}（仍继续扫码）")
 
     def connect_account_after_login(self, cfg: AppConfig, account_id: str) -> None:
         """扫码登录成功后只连接该账号（后台执行，不阻塞 UI）。"""
+        self.release_login_hold(account_id)
         if not self.is_running():
             self.start(cfg)
             return
@@ -294,16 +315,94 @@ class WaCoordinator:
         )
         info(f"账号「{account_id}」正在后台连接（其它账号保持原连接）")
 
+    def request_reconnect_offline(
+        self,
+        cfg: AppConfig,
+        on_done: Optional[Callable[[int, int, int], None]] = None,
+    ) -> bool:
+        """补连当前未在线的已启用账号。服务未运行返回 False。"""
+        loop = self._loop
+        if loop is None or not loop.is_running() or not self.is_running():
+            return False
+        if getattr(self, "_reconnect_busy", False):
+            return False
+        self._reconnect_busy = True
+        session = self._session_id
+
+        async def _run() -> Tuple[int, int, int]:
+            online = self.connected_account_ids()
+            targets = [
+                acc for acc in cfg.accounts if acc.enabled and acc.id not in online
+            ]
+            if not targets:
+                info("没有需要重连的 WhatsApp 账号")
+                return 0, 0, 0
+            info(f"开始重连未连接账号：共 {len(targets)} 个…")
+            ok = fail = 0
+            for acc in targets:
+                if not self._svc_running or session != self._session_id:
+                    break
+                try:
+                    await self._connect_account_incremental(cfg, acc, session)
+                    if self.is_account_online(acc.id):
+                        ok += 1
+                    else:
+                        fail += 1
+                except Exception as exc:
+                    warning(f"重连账号「{acc.id}」失败：{exc}")
+                    fail += 1
+            info(f"重连未连接账号完成：成功 {ok}，失败 {fail}")
+            return ok, fail, 0
+
+        def worker() -> None:
+            ok = fail = skip = 0
+            try:
+                fut = asyncio.run_coroutine_threadsafe(_run(), loop)
+                ok, fail, skip = fut.result(timeout=900)
+            except Exception as exc:
+                warning(f"重连未连接账号失败：{exc}")
+                fail = max(fail, 1)
+            finally:
+                self._reconnect_busy = False
+            if on_done:
+                try:
+                    on_done(ok, fail, skip)
+                except Exception:
+                    pass
+
+        threading.Thread(target=worker, name="wa-reconnect-offline", daemon=True).start()
+        return True
+
     async def _disconnect_account_only(self, account_id: str) -> None:
+        # 等定时任务发完，避免发送协程仍占用会话库（短等，避免拖死扫码）
+        old_lock = self._schedule2._account_locks.get(account_id)
+        if old_lock is not None:
+            try:
+                await asyncio.wait_for(old_lock.acquire(), timeout=2.0)
+                old_lock.release()
+            except asyncio.TimeoutError:
+                warning(f"账号「{account_id}」发送锁等待超时，仍继续断开以便重登")
+            except Exception:
+                pass
+
         with self._lock:
             client = self._clients.pop(account_id, None)
             self._connected_ids.discard(account_id)
+            remaining = dict(self._clients)
+        try:
+            self._schedule2.bind_clients(remaining)
+        except Exception:
+            pass
+
         if client is not None:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
+            await release_wa_client(client, account_id)
             info(f"已断开账号「{account_id}」以便重新登录")
+        else:
+            # 无活跃客户端：仍按 uuid 强制停掉 Go 残留
+            from wa_client import force_stop_account_uuid
+
+            await force_stop_account_uuid(account_id)
+            await asyncio.sleep(0.8)
 
     async def _connect_account_incremental(
         self, cfg: AppConfig, acc: Account, session: int
@@ -322,10 +421,7 @@ class WaCoordinator:
             old = self._clients.pop(acc.id, None)
             self._connected_ids.discard(acc.id)
         if old is not None:
-            try:
-                await old.disconnect()
-            except Exception:
-                pass
+            await release_wa_client(old, acc.id)
 
         r = await self._connect_one(acc, session)
         if r is None or session != self._session_id:
@@ -346,7 +442,7 @@ class WaCoordinator:
             await self._refresh_listen(cfg)
         info(f"账号「{acc.id}」已上线（其它账号保持原连接）")
 
-    def stop(self, join_timeout: float = 3.0) -> None:
+    def stop(self, join_timeout: float = 3.0, *, fallback_stop: bool = True) -> None:
 
         self._svc_running = False
         self._session_id += 1
@@ -370,8 +466,10 @@ class WaCoordinator:
         loop = self._loop
         if t and t.is_alive() and loop is not None and loop.is_running():
             try:
-                fut = asyncio.run_coroutine_threadsafe(stop_all_clients(), loop)
-                fut.result(timeout=min(5.0, max(1.0, join_timeout)))
+                fut = asyncio.run_coroutine_threadsafe(
+                    stop_all_clients(linger_sec=0.1), loop
+                )
+                fut.result(timeout=min(2.0, max(0.3, join_timeout)))
             except Exception:
                 pass
 
@@ -381,11 +479,12 @@ class WaCoordinator:
 
             while t.is_alive() and time.monotonic() < deadline:
 
-                t.join(timeout=min(1.0, max(0.05, deadline - time.monotonic())))
+                t.join(timeout=min(0.25, max(0.05, deadline - time.monotonic())))
 
-        if t and t.is_alive():
+        # 关窗路径关闭 fallback：再 asyncio.run 一整轮 stop 会把关闭拖到数秒以上
+        if fallback_stop and t and t.is_alive():
             try:
-                asyncio.run(stop_all_clients())
+                asyncio.run(stop_all_clients(linger_sec=0.1))
             except Exception:
                 pass
 
@@ -396,6 +495,10 @@ class WaCoordinator:
     ) -> Optional[Tuple[Account, NewAClient]]:
 
         if not self._svc_running or session != self._session_id:
+            return None
+
+        if self.is_login_hold(acc.id):
+            info(f"账号「{acc.id}」正在扫码登录，跳过自动连接")
             return None
 
         if not has_saved_session(acc):
@@ -415,6 +518,15 @@ class WaCoordinator:
                 if client is not None:
                     try:
                         await client.disconnect()
+                    except Exception:
+                        pass
+                return None
+
+            if self.is_login_hold(acc.id):
+                info(f"账号「{acc.id}」正在扫码登录，中止自动连接")
+                if client is not None:
+                    try:
+                        await release_wa_client(client, acc.id)
                     except Exception:
                         pass
                 return None
@@ -483,6 +595,10 @@ class WaCoordinator:
 
             await asyncio.sleep(index * _STAGGER_SEC)
 
+        if self.is_login_hold(acc.id):
+            info(f"账号「{acc.id}」正在扫码登录，跳过排队连接")
+            return None
+
         return await self._connect_one(acc, session)
 
 
@@ -510,9 +626,14 @@ class WaCoordinator:
 
 
 
-        info("正在释放旧连接…")
-        await stop_all_clients()
-        await asyncio.sleep(0.8)
+        from wa_client import neonize_runtime_active, stop_all_clients
+
+        if neonize_runtime_active():
+            info("正在释放旧连接…")
+            await stop_all_clients()
+            await asyncio.sleep(0.8)
+        else:
+            info("WhatsApp 冷启动，跳过释放旧连接")
 
 
 
@@ -639,5 +760,59 @@ class WaCoordinator:
                 pass
 
         threading.Thread(target=worker, name="wa-watch-audit", daemon=True).start()
+        return True
+
+    def request_bulk_image_send(
+        self,
+        job_ids: List[str],
+        image_path: str = "",
+        *,
+        image_paths: Optional[List[str]] = None,
+        on_progress: Optional[Callable[[int, int, Any], None]] = None,
+        on_done: Optional[Callable[[int, int, int], None]] = None,
+        sync_to_customer: bool = False,
+        customer_extra_text: str = "",
+    ) -> bool:
+        """在统一会话线程排队发图。成功返回 True（已提交）。"""
+        loop = self._loop
+        with self._lock:
+            has_clients = bool(self._clients)
+        if loop is None or not loop.is_running() or not has_clients:
+            return False
+        ids = list(job_ids)
+        paths = list(image_paths or [])
+        if (image_path or "").strip():
+            paths.append(image_path.strip())
+        extra = (customer_extra_text or "").strip()
+        # 同步客户：每任务约 +90s，超时按任务数放宽
+        timeout_sec = 3600.0
+        if sync_to_customer:
+            timeout_sec = max(3600.0, 120.0 * max(1, len(ids)) + 600.0)
+
+        def worker() -> None:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._schedule2.run_bulk_image_send(
+                    ids,
+                    image_paths=paths,
+                    on_progress=on_progress,
+                    sync_to_customer=sync_to_customer,
+                    customer_extra_text=extra,
+                ),
+                loop,
+            )
+            try:
+                ok, fail, resumed = fut.result(timeout=timeout_sec)
+            except Exception as exc:
+                warning(f"一键发图失败：{exc}")
+                ok = 0
+                fail = max(1, len(ids))
+                resumed = 0
+            if on_done:
+                try:
+                    on_done(ok, fail, resumed)
+                except Exception:
+                    pass
+
+        threading.Thread(target=worker, name="wa-bulk-image", daemon=True).start()
         return True
 

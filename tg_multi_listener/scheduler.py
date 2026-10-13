@@ -8,7 +8,7 @@ import random
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from telethon import TelegramClient
 
@@ -24,8 +24,26 @@ from .compat_config import (
     resolve_job_chat_targets,
     telegram_chat_matches_address_ref,
 )
-from .logger_util import error, info, warning
+from .job_file_cache import load_jobs_cached, runner_loop_sleep_seconds, set_jobs_cache
+from .logger_util import debug, error, info, warning
 from .watch_read_tracker import TgWatchReadTracker, mark_watch_read_before_send
+
+from i18n.job_card import format_job_status_label
+from i18n.pause_reason import (
+    CODE_AWAIT_IMAGE_SEND,
+    CODE_JOIN_GROUP_FAILED,
+    CODE_LISTEN_HIT,
+    CODE_MANUAL,
+    CODE_MIGRATED,
+    CODE_NEW_JOB,
+    CODE_ROUND_COMPLETE,
+    CODE_STAGE_LISTEN_HIT,
+    CODE_STAGE_REMINDER,
+    CODE_STARTUP_DOC,
+    is_await_image_send,
+    pause_reason_is,
+    resolve_listen_pause_reason,
+)
 
 
 async def send_telegram_message_resilient(client: TelegramClient, entity: Any, text: str, *, attempts: int = 6) -> Any:
@@ -48,8 +66,36 @@ async def send_telegram_message_resilient(client: TelegramClient, entity: Any, t
         raise last
 
 
+async def send_telegram_file_resilient(
+    client: TelegramClient,
+    entity: Any,
+    file_path: str,
+    *,
+    caption: str = "",
+    attempts: int = 6,
+) -> Any:
+    """发送图片/文件；遇 session SQLite locked 时短暂退避重试。"""
+    delay = 0.2
+    last: Optional[BaseException] = None
+    cap = (caption or "").strip() or None
+    for i in range(max(1, attempts)):
+        try:
+            return await client.send_file(entity, file_path, caption=cap)
+        except Exception as exc:
+            last = exc
+            msg = str(exc).lower()
+            if "database is locked" in msg or "unable to open database" in msg:
+                if i + 1 < attempts:
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 1.8, 2.5)
+                    continue
+            raise
+    if last:
+        raise last
+
+
 async def _resolve_entity_for_send(client: TelegramClient, chat_ref: Union[int, str]) -> Any:
-    """把群 ID（整数）或 @用户名 / t.me 等字符串解析为可发送对象。"""
+    """把群 ID（整数）或 @用户名 / t.me / 邀请链接等解析为可发送对象。"""
     if isinstance(chat_ref, str):
         s = chat_ref.strip()
         if not s:
@@ -57,6 +103,17 @@ async def _resolve_entity_for_send(client: TelegramClient, chat_ref: Union[int, 
         if (s.startswith("-") and len(s) > 1 and s[1:].isdigit()) or (s.isdigit() and not s.startswith("@")):
             chat_ref = int(s)
         else:
+            from .group_auto_join import tg_invite_hash
+
+            inv = tg_invite_hash(s)
+            if inv:
+                from telethon.tl.functions.messages import CheckChatInviteRequest
+                from telethon.tl.types import ChatInviteAlready
+
+                res = await client(CheckChatInviteRequest(inv))
+                if isinstance(res, ChatInviteAlready) and getattr(res, "chat", None) is not None:
+                    return res.chat
+                raise ValueError("尚未加入该邀请链接对应的群（请等待自动入群或手动加入）")
             try:
                 return await client.get_entity(s)
             except Exception:
@@ -84,12 +141,17 @@ class DocMessage:
     """True 表示本条 间隔= 来自 TXT；否则发完后用任务级固定间隔。"""
     interval_from_txt: bool = False
     want_reactions: bool = False
+    """TXT「类型=发图」：不发送正文，暂停待任务管理一键发图。"""
+    is_image_send: bool = False
 
     def effective_send_account_id(self) -> str:
         return (self.send_as_account_id or self.original_account_id or self.account_id or "").strip()
 
     def original_label(self) -> str:
         return (self.original_account_id or self.account_id or "").strip()
+
+    def is_non_send_step(self) -> bool:
+        return bool(self.is_reminder or self.is_image_send)
 
 
 @dataclass
@@ -155,10 +217,10 @@ class ScheduledJob:
         return len(self.items)
 
     def send_progress(self) -> tuple[int, int, int]:
-        """返回 (待发消息总数, 已发消息数, 剩余待发消息数)；不含阶段提醒步。"""
-        total = sum(1 for it in self.items if not it.is_reminder)
+        """返回 (待发消息总数, 已发消息数, 剩余待发消息数)；不含阶段提醒/发图步。"""
+        total = sum(1 for it in self.items if not it.is_non_send_step())
         c = max(0, min(int(self.cursor), len(self.items)))
-        done = sum(1 for it in self.items[:c] if not it.is_reminder)
+        done = sum(1 for it in self.items[:c] if not it.is_non_send_step())
         return total, done, max(0, total - done)
 
     def current_item(self) -> Optional[DocMessage]:
@@ -196,6 +258,7 @@ def _doc_from_dict(x: Dict[str, Any], *, legacy_gap_min: float = 5.0, legacy_gap
         delay_m = random.uniform(lo, hi) if hi > lo else lo
     from_txt = bool(x.get("interval_from_txt", False))
     want_rx = bool(x.get("want_reactions", False))
+    is_img = bool(x.get("is_image_send", False))
     if is_rem:
         return DocMessage(
             account_id=acc,
@@ -207,6 +270,20 @@ def _doc_from_dict(x: Dict[str, Any], *, legacy_gap_min: float = 5.0, legacy_gap
             send_as_account_id=send,
             interval_from_txt=from_txt,
             want_reactions=want_rx,
+            is_image_send=False,
+        )
+    if is_img and (orig or acc):
+        return DocMessage(
+            account_id=orig or acc,
+            content="",
+            is_reminder=False,
+            reminder_note=note,
+            delay_after_minutes=delay_m,
+            original_account_id=orig or acc,
+            send_as_account_id=send or orig or acc,
+            interval_from_txt=from_txt,
+            want_reactions=False,
+            is_image_send=True,
         )
     if acc and txt:
         return DocMessage(
@@ -219,6 +296,7 @@ def _doc_from_dict(x: Dict[str, Any], *, legacy_gap_min: float = 5.0, legacy_gap
             send_as_account_id=send or orig or acc,
             interval_from_txt=from_txt,
             want_reactions=want_rx,
+            is_image_send=False,
         )
     return None
 
@@ -281,7 +359,7 @@ def migrate_schedule2_into_schedules_once() -> int:
                 chat_entry_ids=list(sj.chat_entry_ids),
                 cursor=sj.cursor,
                 state=sj.state if sj.state in ("running", "paused") else "paused",
-                pause_reason=sj.pause_reason or "已从定时任务2迁移",
+                pause_reason=sj.pause_reason or CODE_MIGRATED,
                 next_send_ts=sj.next_send_ts,
                 remaining_seconds=sj.remaining_seconds,
                 last_send_ts=sj.last_send_ts,
@@ -381,9 +459,9 @@ def _load_jobs_raw() -> List[ScheduledJob]:
     return jobs
 
 
-def load_jobs() -> List[ScheduledJob]:
+def load_jobs(*, force: bool = False) -> List[ScheduledJob]:
     migrate_schedule2_into_schedules_once()
-    return _load_jobs_raw()
+    return load_jobs_cached(SCHEDULE_FILE, _load_jobs_raw, force=force)
 
 
 def save_jobs(jobs: List[ScheduledJob]) -> None:
@@ -391,6 +469,7 @@ def save_jobs(jobs: List[ScheduledJob]) -> None:
 
     ensure_dirs()
     atomic_write_json(SCHEDULE_FILE, [_job_to_dict(j) for j in jobs])
+    set_jobs_cache(SCHEDULE_FILE, jobs)
 
 
 def save_jobs_patch(updated: List[ScheduledJob]) -> None:
@@ -476,15 +555,150 @@ def advance_scheduled_folder_day(job: ScheduledJob, cfg: AppConfig) -> tuple[boo
     return True, ""
 
 
-STARTUP_PAUSE_REASON = "程序启动后已自动暂停，请在定时任务中点「继续」后再运行。"
-NEW_JOB_PAUSE_REASON = "新建任务，请点「继续」后开始"
-STAGE_REMINDER_PAUSE_REASON = "定时任务阶段提醒，已自动暂停"
-LISTEN_HIT_PAUSE_REASON = "监听命中目标用户，自动暂停"
-STAGE_LISTEN_HIT_PAUSE_REASON = "阶段提醒后监听命中，自动暂停"
+def reload_scheduled_folder_scripts(job: ScheduledJob, cfg: AppConfig) -> tuple[bool, str]:
+    """重新扫描文件夹并重读「当前天」TXT（不切天、不改暂停/启用），光标钳制到新长度。"""
+    from schedule_folder import is_folder_job, rescan_folder_files_keep_day, resolve_folder_day_filename
+
+    if not is_folder_job(job):
+        return False, "不是文件夹任务"
+    ordered, new_idx, err = rescan_folder_files_keep_day(job)
+    if err:
+        return False, err
+    rel = resolve_folder_day_filename(job.folder_path, ordered[new_idx])
+    ok, rerr = _reload_folder_day_items_tg(job, cfg, rel)
+    if not ok:
+        return False, rerr
+    job.folder_files = list(ordered)
+    job.folder_files[new_idx] = rel
+    job.folder_day_index = new_idx
+    n = len(job.items or [])
+    job.cursor = max(0, min(int(job.cursor or 0), n))
+    job.last_error = ""
+    return True, ""
+
+
+def reload_scheduled_file_script(job: ScheduledJob, cfg: AppConfig) -> tuple[bool, str]:
+    """重读单 TXT 任务话术，保留并钳制 cursor。"""
+    from .group_owner import apply_main_account_mapping, clone_doc_items, doc_has_main_account_placeholder
+    from .schedule_txt_import import import_doc_items
+
+    path = (job.source_path or "").strip()
+    if not path:
+        return False, "任务未记录 TXT 路径"
+    if not os.path.isfile(path):
+        return False, f"找不到 TXT：{path}"
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            text = f.read()
+    except OSError as exc:
+        return False, f"读取失败：{exc}"
+    valid = {a.id for a in cfg.accounts if getattr(a, "enabled", True)}
+    items, _errors = import_doc_items(
+        text, valid_accounts=valid, require_per_item_interval=False
+    )
+    sends = [it for it in items if not it.is_reminder]
+    if not sends:
+        return False, "TXT 中没有可发送条目"
+    if doc_has_main_account_placeholder(items):
+        emap = {e.id: e for e in cfg.address_book}
+        owner = ""
+        for eid in job.chat_entry_ids:
+            ent = emap.get(eid)
+            if ent:
+                owner = (ent.owner_account_id or "").strip()
+                break
+        if not owner:
+            return False, "未在通讯录设置归属账号"
+        if owner not in valid:
+            return False, f"归属账号「{owner}」未启用"
+        job_items = clone_doc_items(items)
+        if apply_main_account_mapping(job_items, owner) == 0:
+            return False, "文档中未找到 账号=主号（或主账号）条目"
+        items = job_items
+    job.items = items
+    job.source_name = os.path.basename(path) or job.source_name
+    n = len(job.items or [])
+    job.cursor = max(0, min(int(job.cursor or 0), n))
+    job.last_error = ""
+    return True, ""
+
+
+def reload_scheduled_job_scripts(job: ScheduledJob, cfg: AppConfig) -> tuple[bool, str]:
+    """重读任务当前话术：文件夹=当前天；单文件=source_path。从原步数继续。"""
+    from schedule_folder import is_folder_job
+
+    if is_folder_job(job):
+        return reload_scheduled_folder_scripts(job, cfg)
+    return reload_scheduled_file_script(job, cfg)
+
+
+def bulk_reload_scheduled_job_scripts(
+    jobs: Optional[List[ScheduledJob]] = None,
+    cfg: Optional[AppConfig] = None,
+) -> tuple[int, int, List[str]]:
+    """批量重读全部任务当前话术。返回 (成功, 失败, 失败摘要)。"""
+    if cfg is None:
+        cfg = load_config()
+    if jobs is None:
+        jobs = load_jobs()
+    ok_n = fail_n = 0
+    fails: List[str] = []
+    touched: List[ScheduledJob] = []
+    for j in jobs:
+        path = (getattr(j, "source_path", "") or "").strip()
+        folder = (getattr(j, "folder_path", "") or "").strip()
+        if not path and not folder:
+            continue
+        ok, err = reload_scheduled_job_scripts(j, cfg)
+        if ok:
+            ok_n += 1
+            touched.append(j)
+        else:
+            fail_n += 1
+            if len(fails) < 8:
+                fails.append(f"{j.source_name or j.id}: {err}")
+    if touched:
+        save_jobs_patch(touched)
+    return ok_n, fail_n, fails
+
+
+STARTUP_PAUSE_REASON = CODE_STARTUP_DOC
+NEW_JOB_PAUSE_REASON = CODE_NEW_JOB
+STAGE_REMINDER_PAUSE_REASON = CODE_STAGE_REMINDER
+AWAIT_IMAGE_SEND_PAUSE_REASON = CODE_AWAIT_IMAGE_SEND
+JOIN_GROUP_FAILED_PAUSE_REASON = CODE_JOIN_GROUP_FAILED
+LISTEN_HIT_PAUSE_REASON = CODE_LISTEN_HIT
+STAGE_LISTEN_HIT_PAUSE_REASON = CODE_STAGE_LISTEN_HIT
 
 # 点「继续/开始」或阶段提醒后继续：随机 30–60 秒再发，避免多任务同一时刻并发。
 RESUME_RANDOM_DELAY_MIN_SEC = 30.0
 RESUME_RANDOM_DELAY_MAX_SEC = 60.0
+# 多群同时到点时并发处理；同一账号保留较小并发，避免几十个任务串行排队数分钟。
+GLOBAL_SEND_CONCURRENCY = 16
+PER_ACCOUNT_SEND_CONCURRENCY = 4
+
+
+def _doc_job_by_id(job_id: str, jobs: Optional[List[ScheduledJob]] = None) -> Optional[ScheduledJob]:
+    if jobs is None:
+        jobs = load_jobs()
+    return next((x for x in jobs if x.id == job_id), None)
+
+
+def is_doc_job_send_allowed(job_id: str) -> bool:
+    j = _doc_job_by_id(job_id)
+    return bool(j and j.enabled and j.state != "paused")
+
+
+def _safe_patch_doc_jobs(updated: List[ScheduledJob]) -> None:
+    to_write: List[ScheduledJob] = []
+    fresh_by_id = {j.id: j for j in load_jobs()}
+    for j in updated:
+        fresh = fresh_by_id.get(j.id)
+        if fresh is not None and fresh.state == "paused" and j.state != "paused":
+            continue
+        to_write.append(j)
+    if to_write:
+        save_jobs_patch(to_write)
 
 
 def _random_resume_delay_seconds() -> float:
@@ -493,14 +707,14 @@ def _random_resume_delay_seconds() -> float:
 
 def _first_send_step_index(job: ScheduledJob) -> Optional[int]:
     for i, it in enumerate(job.items):
-        if not it.is_reminder:
+        if not it.is_non_send_step():
             return i
     return None
 
 
 def _resume_delay_seconds(job: ScheduledJob) -> float:
     reason = (job.pause_reason or "").strip()
-    if reason == STAGE_REMINDER_PAUSE_REASON:
+    if pause_reason_is(reason, CODE_STAGE_REMINDER) or is_await_image_send(reason):
         return _random_resume_delay_seconds()
     if job.last_send_ts <= 0:
         fi = _first_send_step_index(job)
@@ -599,7 +813,8 @@ class ScheduleRunner:
         self._api_id: int = 0
         self._api_hash: str = ""
         self._shared_clients: Optional[Dict[str, TelegramClient]] = None
-        self._account_locks: Dict[str, asyncio.Lock] = {}
+        self._account_locks: Dict[str, Any] = {}
+        self._send_slots: Optional[asyncio.Semaphore] = None
         self._async_loop: Optional[asyncio.AbstractEventLoop] = None
         self._reminder_callback: Optional[Callable[[ScheduledJob, DocMessage, int], None]] = None
         self._read_tracker: Optional[TgWatchReadTracker] = None
@@ -608,16 +823,29 @@ class ScheduleRunner:
         self._read_tracker = tracker
 
     def _emit_reminder(
-        self, job: ScheduledJob, item: DocMessage, step_one_based: int, paused_count: int = 0
+        self,
+        job: ScheduledJob,
+        item: DocMessage,
+        step_one_based: int,
+        paused_count: int = 0,
+        affected_job_ids: Optional[List[str]] = None,
     ) -> None:
         cb = self._reminder_callback
         if not cb:
             return
+        ids = list(dict.fromkeys(affected_job_ids or []))
+        if job.id not in ids:
+            ids.append(job.id)
         try:
-            cb(job, item, step_one_based, paused_count)
+            cb(job, item, step_one_based, paused_count, ids)
         except TypeError:
             try:
-                cb(job, item, step_one_based)
+                cb(job, item, step_one_based, paused_count)
+            except TypeError:
+                try:
+                    cb(job, item, step_one_based)
+                except Exception as exc:
+                    error(f"阶段提醒回调异常：{exc}")
             except Exception as exc:
                 error(f"阶段提醒回调异常：{exc}")
         except Exception as exc:
@@ -628,7 +856,18 @@ class ScheduleRunner:
 
     def bind_telegram_clients(self, clients: Dict[str, TelegramClient]) -> None:
         self._shared_clients = dict(clients)
-        self._account_locks = {k: asyncio.Lock() for k in self._shared_clients}
+        prev = getattr(self, "_account_locks", None) or {}
+        # 重连补号时复用已有锁，避免在线账号发送中途被换锁
+        self._account_locks = {
+            key: (
+                prev[key]
+                if key in prev
+                else asyncio.Semaphore(PER_ACCOUNT_SEND_CONCURRENCY)
+            )
+            for key in self._shared_clients
+        }
+        if self._send_slots is None:
+            self._send_slots = asyncio.Semaphore(GLOBAL_SEND_CONCURRENCY)
         try:
             self._async_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -637,6 +876,7 @@ class ScheduleRunner:
     def unbind_telegram_clients(self) -> None:
         self._shared_clients = None
         self._account_locks = {}
+        self._send_slots = None
         self._async_loop = None
 
     def refresh_config(self, cfg: AppConfig) -> None:
@@ -653,7 +893,7 @@ class ScheduleRunner:
     def stop(self) -> None:
         self._running = False
 
-    def pause_job(self, job_id: str, reason: str = "手动暂停") -> bool:
+    def pause_job(self, job_id: str, reason: str = CODE_MANUAL) -> bool:
         jobs = load_jobs()
         now = time.time()
         changed = False
@@ -700,6 +940,61 @@ class ScheduleRunner:
             save_jobs_patch([j for j in jobs if j.id == job_id])
         return changed
 
+    def finish_job_after_last_image(self, job_id: str) -> bool:
+        """发图步为最后一步且已发出：标记一轮完成。"""
+        from i18n.pause_reason import CODE_ROUND_COMPLETE
+
+        jobs = load_jobs()
+        touched: Optional[ScheduledJob] = None
+        for j in jobs:
+            if j.id != job_id:
+                continue
+            j.enabled = False
+            j.state = "paused"
+            j.pause_reason = CODE_ROUND_COMPLETE
+            j.next_send_ts = 0.0
+            j.remaining_seconds = 0.0
+            touched = j
+            break
+        if touched is not None:
+            save_jobs_patch([touched])
+            return True
+        return False
+
+    async def run_bulk_image_send(
+        self,
+        job_ids: List[str],
+        image_path: str = "",
+        *,
+        image_paths: Optional[List[str]] = None,
+        on_progress: Optional[Callable[[int, int, Any], None]] = None,
+        sync_to_customer: bool = False,
+        customer_extra_text: str = "",
+    ) -> Tuple[int, int, int]:
+        """在 Telethon 会话循环内：按 job_ids 发图（可 1–3 张），成功则自动 resume。返回 (ok, fail, resumed)。"""
+        from .one_click_image import bulk_send_images_and_resume, is_job_awaiting_image
+
+        cfg = load_config()
+        jobs_all = load_jobs()
+        by_id = {j.id: j for j in jobs_all}
+        jobs = [by_id[i] for i in job_ids if i in by_id and is_job_awaiting_image(by_id[i])]
+        if not jobs:
+            return 0, 0, 0
+        shared = self._shared_clients or {}
+        return await bulk_send_images_and_resume(
+            jobs=jobs,
+            cfg=cfg,
+            shared_clients=shared,
+            account_locks=self._account_locks,
+            image_path=image_path,
+            image_paths=image_paths,
+            resume_job=self.resume_job,
+            finish_job_if_exhausted=self.finish_job_after_last_image,
+            on_progress=on_progress,
+            sync_to_customer=sync_to_customer,
+            customer_extra_text=customer_extra_text,
+        )
+
     def resume_all_jobs(self) -> int:
         """恢复所有暂停中的文档任务（跳过已完成；重跑请点单卡「重新开始」）。"""
         jobs = load_jobs()
@@ -732,11 +1027,10 @@ class ScheduleRunner:
         raw_chat_id: Optional[int] = None,
         event_username: Optional[str] = None,
         event_title: Optional[str] = None,
-    ) -> int:
+    ) -> List[str]:
         jobs = load_jobs()
         cfg = load_config()
         now = time.time()
-        cnt = 0
         cid = int(chat_id)
         raw_c = int(raw_chat_id) if raw_chat_id is not None else cid
 
@@ -793,9 +1087,7 @@ class ScheduleRunner:
                 j.state = "paused"
                 changed = True
             effective = reason
-            if reason == LISTEN_HIT_PAUSE_REASON:
-                from wa_ui.taskmgr_tile_theme import resolve_listen_pause_reason
-
+            if pause_reason_is(reason, CODE_LISTEN_HIT):
                 effective = resolve_listen_pause_reason(
                     enabled=j.enabled,
                     previous_reason=j.pause_reason,
@@ -806,12 +1098,11 @@ class ScheduleRunner:
                 changed = True
             if changed:
                 touched.append(j)
-                cnt += 1
         if touched:
             save_jobs_patch(touched)
-        return cnt
+        return [j.id for j in touched]
 
-    def pause_jobs_for_job_targets(self, cfg: AppConfig, job: ScheduledJob, reason: str) -> int:
+    def pause_jobs_for_job_targets(self, cfg: AppConfig, job: ScheduledJob, reason: str) -> List[str]:
         """暂停该任务及发到相同群目标的其它文档任务。"""
         jobs = load_jobs()
         now = time.time()
@@ -849,7 +1140,6 @@ class ScheduleRunner:
             return False
 
         touched: List[ScheduledJob] = []
-        cnt = 0
         for j in jobs:
             if not j.enabled or j.state == "paused" or not job_shares_target(j):
                 continue
@@ -863,10 +1153,9 @@ class ScheduleRunner:
             j.state = "paused"
             j.pause_reason = reason
             touched.append(j)
-            cnt += 1
         if touched:
             save_jobs_patch(touched)
-        return cnt
+        return [j.id for j in touched]
 
     async def _async_main(self) -> None:
         while self._running:
@@ -874,6 +1163,15 @@ class ScheduleRunner:
                 now = time.time()
                 jobs = load_jobs()
                 dirty: Dict[str, ScheduledJob] = {}
+                pending: List[
+                    Tuple[
+                        ScheduledJob,
+                        DocMessage,
+                        List[Union[int, str]],
+                        str,
+                        "asyncio.Task[bool]",
+                    ]
+                ] = []
                 for j in jobs:
                     if not self._running:
                         break
@@ -896,7 +1194,7 @@ class ScheduleRunner:
                         # 已到文档末尾：自动停止该任务，不再重复轮播。
                         j.enabled = False
                         j.state = "paused"
-                        j.pause_reason = "一轮发送完成，任务自动停止"
+                        j.pause_reason = CODE_ROUND_COMPLETE
                         j.next_send_ts = 0.0
                         dirty[j.id] = j
                         continue
@@ -908,7 +1206,7 @@ class ScheduleRunner:
                         if j.cursor >= len(j.items):
                             j.enabled = False
                             j.state = "paused"
-                            j.pause_reason = "一轮发送完成，任务自动停止"
+                            j.pause_reason = CODE_ROUND_COMPLETE
                             j.next_send_ts = 0.0
                             j.remaining_seconds = 0.0
                         else:
@@ -924,14 +1222,45 @@ class ScheduleRunner:
                             j.pause_reason = STAGE_REMINDER_PAUSE_REASON
                             j.next_send_ts = 0.0
                         dirty[j.id] = j
+                        save_jobs_patch([j])
                         cfg_rem = load_config()
-                        paused_n = self.pause_jobs_for_job_targets(cfg_rem, j, STAGE_REMINDER_PAUSE_REASON)
+                        related_ids = self.pause_jobs_for_job_targets(cfg_rem, j, STAGE_REMINDER_PAUSE_REASON)
                         grp = format_job_targets_label(cfg_rem, j)
                         info(
                             f"文档任务阶段提醒：{j.id} 群={grp} 文档={j.source_name} 步={step}"
-                            + (f"；已暂停 {paused_n} 个相关任务" if paused_n else "")
+                            + (f"；已暂停 {len(related_ids)} 个相关任务" if related_ids else "")
                         )
-                        self._emit_reminder(j, item, step, paused_n)
+                        affected = list(dict.fromkeys([j.id, *related_ids]))
+                        self._emit_reminder(j, item, step, len(related_ids), affected_job_ids=affected)
+                        continue
+                    if getattr(item, "is_image_send", False):
+                        step = j.cursor + 1
+                        j.cursor += 1
+                        j.last_send_ts = time.time()
+                        j.last_error = ""
+                        remain = (
+                            max(1.0, j.next_send_ts - now)
+                            if j.next_send_ts > now
+                            else _delay_seconds_after_item(
+                                j, j.cursor - 1 if j.cursor > 0 else 0
+                            )
+                        )
+                        j.remaining_seconds = _clamp_remain_seconds(remain)
+                        j.state = "paused"
+                        j.pause_reason = AWAIT_IMAGE_SEND_PAUSE_REASON
+                        j.next_send_ts = 0.0
+                        # 即使是最后一步：仍待发图，发完后再标一轮完成
+                        dirty[j.id] = j
+                        save_jobs_patch([j])
+                        cfg_img = load_config()
+                        grp = format_job_targets_label(cfg_img, j)
+                        note = (item.reminder_note or "").strip()
+                        info(
+                            f"文档任务待发图：{j.id} 群={grp} 文档={j.source_name} 步={step}"
+                            f" 账号={item.original_label()}"
+                            + (f" 备注={note}" if note else "")
+                            + "；请在任务管理点「一键发送图片」"
+                        )
                         continue
                     cfg = load_config()
                     targets = resolve_job_chat_targets(cfg, j)
@@ -944,40 +1273,118 @@ class ScheduleRunner:
                     from .group_owner import send_account_for_job_item
 
                     acc_send = send_account_for_job_item(cfg, j, item)
-                    ok = await self._send_one_to_many(
-                        targets,
-                        acc_send,
-                        item.content,
-                        job_id=j.id,
-                        want_reactions=bool(getattr(item, "want_reactions", False)),
-                        job=j,
-                        cfg=cfg,
-                    )
-                    sent_idx = j.cursor
-                    if ok:
-                        j.cursor += 1
-                        j.last_send_ts = time.time()
-                        j.last_error = ""
-                        record_address_book_last_schedule(j.chat_entry_ids, j.source_name)
-                        info(
-                            f"文档任务已发送：{j.id} 文档={j.source_name} "
-                            f"实际账号={acc_send}（原文={item.original_label()}）目标数={len(targets)}"
+                    if not is_doc_job_send_allowed(j.id):
+                        continue
+                    abort_check = lambda jid=j.id: not is_doc_job_send_allowed(jid)
+                    task = asyncio.create_task(
+                        self._send_one_to_many(
+                            targets,
+                            acc_send,
+                            item.content,
+                            job_id=j.id,
+                            want_reactions=bool(getattr(item, "want_reactions", False)),
+                            job=j,
+                            cfg=cfg,
+                            abort_check=abort_check,
                         )
-                        if j.cursor >= len(j.items):
-                            j.enabled = False
-                            j.state = "paused"
-                            j.pause_reason = "一轮发送完成，任务自动停止"
-                            j.next_send_ts = 0.0
-                            dirty[j.id] = j
+                    )
+                    pending.append((j, item, targets, acc_send, task))
+
+                if pending:
+                    results = await asyncio.gather(
+                        *(row[4] for row in pending),
+                        return_exceptions=True,
+                    )
+                    for (j, item, targets, acc_send, _task), result in zip(
+                        pending, results
+                    ):
+                        if isinstance(result, BaseException):
+                            send_exc = result
+                            from .group_auto_join import AutoJoinFailed
+
+                            if isinstance(send_exc, AutoJoinFailed):
+                                step = j.cursor + 1
+                                j.state = "paused"
+                                j.pause_reason = JOIN_GROUP_FAILED_PAUSE_REASON
+                                j.next_send_ts = 0.0
+                                j.remaining_seconds = 0.0
+                                j.last_error = str(send_exc)
+                                dirty[j.id] = j
+                                save_jobs_patch([j])
+                                warning(
+                                    f"文档任务入群失败已暂停：{j.source_name} "
+                                    f"账号={send_exc.account_id} 群={send_exc.chat_ref} {send_exc}"
+                                )
+                                note = (
+                                    f"账号「{send_exc.account_id}」入群失败\n"
+                                    f"群：{send_exc.chat_ref}\n{send_exc}"
+                                )
+                                fake = DocMessage(
+                                    account_id=send_exc.account_id or acc_send,
+                                    content="",
+                                    reminder_note=note,
+                                    original_account_id=send_exc.account_id
+                                    or acc_send,
+                                )
+                                self._emit_reminder(
+                                    j,
+                                    fake,
+                                    step,
+                                    0,
+                                    affected_job_ids=[j.id],
+                                )
+                                continue
+                            error(
+                                f"文档任务发送异常：任务={j.id} "
+                                f"账号={acc_send} 错误={send_exc}"
+                            )
+                            ok = False
+                        else:
+                            ok = bool(result)
+
+                        if not is_doc_job_send_allowed(j.id):
+                            info(
+                                f"文档任务发送已取消：{j.source_name}"
+                                "（监听命中已暂停）"
+                            )
                             continue
-                    else:
-                        j.last_error = "发送失败，已按本条间隔重试"
-                    j.next_send_ts = time.time() + _delay_seconds_after_item(j, sent_idx)
-                    dirty[j.id] = j
+                        sent_idx = j.cursor
+                        if ok:
+                            j.cursor += 1
+                            j.last_send_ts = time.time()
+                            j.last_error = ""
+                            record_address_book_last_schedule(
+                                j.chat_entry_ids, j.source_name
+                            )
+                            info(
+                                f"文档任务已发送：{j.source_name} "
+                                f"发送方={acc_send} "
+                                f"原文={item.original_label()} "
+                                f"目标数={len(targets)}"
+                            )
+                            if j.cursor >= len(j.items):
+                                j.enabled = False
+                                j.state = "paused"
+                                j.pause_reason = CODE_ROUND_COMPLETE
+                                j.next_send_ts = 0.0
+                                dirty[j.id] = j
+                                continue
+                        else:
+                            j.last_error = "发送失败，已按本条间隔重试"
+                        j.next_send_ts = (
+                            time.time()
+                            + _delay_seconds_after_item(j, sent_idx)
+                        )
+                        dirty[j.id] = j
 
                 if dirty:
-                    save_jobs_patch(list(dirty.values()))
-                await asyncio.sleep(0.8)
+                    _safe_patch_doc_jobs(list(dirty.values()))
+                sleep_sec = runner_loop_sleep_seconds(
+                    jobs,
+                    now,
+                    step_count=lambda x: x.item_count(),
+                )
+                await asyncio.sleep(sleep_sec)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -994,8 +1401,11 @@ class ScheduleRunner:
         want_reactions: bool = False,
         job: Optional[ScheduledJob] = None,
         cfg: Optional[AppConfig] = None,
+        abort_check: Optional[Callable[[], bool]] = None,
     ) -> bool:
         account_id = (account_id or "").strip()
+        if abort_check and abort_check():
+            return False
         if not self._api_id or not self._api_hash.strip():
             warning("文档任务发送跳过：未配置共用 api_id / api_hash")
             return False
@@ -1013,9 +1423,13 @@ class ScheduleRunner:
             return False
         lock = self._account_locks.get(account_id)
         if lock is None:
-            lock = asyncio.Lock()
+            lock = asyncio.Semaphore(PER_ACCOUNT_SEND_CONCURRENCY)
             self._account_locks[account_id] = lock
-        async with lock:
+        send_slots = self._send_slots
+        if send_slots is None:
+            send_slots = asyncio.Semaphore(GLOBAL_SEND_CONCURRENCY)
+            self._send_slots = send_slots
+        async with send_slots, lock:
             try:
                 if not await client.is_user_authorized():
                     warning(f"文档任务发送跳过：账号 {account_id} 未登录")
@@ -1023,15 +1437,34 @@ class ScheduleRunner:
                 ok = False
                 enabled_ids = {aid for aid, a in self._accounts.items() if a.enabled}
                 for cref in chat_refs:
+                    if abort_check and abort_check():
+                        return False
                     try:
+                        from .group_auto_join import AutoJoinAborted, ensure_tg_sender_in_group
+
+                        try:
+                            await ensure_tg_sender_in_group(
+                                client, account_id, cref, abort_check=abort_check
+                            )
+                        except AutoJoinAborted:
+                            return False
                         entity = await _resolve_entity_for_send(client, cref)
                         await mark_watch_read_before_send(
                             client, account_id, entity, self._read_tracker
                         )
-                        from send_typing_util import telegram_typing_before_send
+                        from send_typing_util import telegram_send_with_typing
 
-                        await telegram_typing_before_send(client, entity, content)
-                        msg = await send_telegram_message_resilient(client, entity, content)
+                        msg = await telegram_send_with_typing(
+                            client,
+                            entity,
+                            content,
+                            lambda: send_telegram_message_resilient(
+                                client, entity, content
+                            ),
+                            abort_check=abort_check,
+                        )
+                        if msg is None:
+                            return False
                         ok = True
                         if want_reactions and msg is not None and cfg is not None and job is not None:
                             from schedule_reactions import (
@@ -1040,7 +1473,7 @@ class ScheduleRunner:
                             )
 
                             main_acc = resolve_main_account_for_job_target(cfg, job, cref)
-                            n_rx = schedule_telegram_reactions(
+                            schedule_telegram_reactions(
                                 shared_clients=shared,
                                 account_locks=self._account_locks,
                                 chat_ref=cref,
@@ -1049,12 +1482,11 @@ class ScheduleRunner:
                                 main_account_id=main_acc,
                                 enabled_account_ids=enabled_ids,
                             )
-                            if n_rx:
-                                info(
-                                    f"[TG] 文档任务点赞：任务={job_id} 群={cref} "
-                                    f"已排程={n_rx}（各账号 1–10 分钟后）"
-                                )
                     except Exception as exc:
+                        from .group_auto_join import AutoJoinFailed
+
+                        if isinstance(exc, AutoJoinFailed):
+                            raise
                         hint = ""
                         if "Could not find the input entity" in str(exc) or "PeerChannel" in str(exc):
                             hint = (
@@ -1067,5 +1499,9 @@ class ScheduleRunner:
                         await asyncio.sleep(0.2)
                 return ok
             except Exception as exc:
+                from .group_auto_join import AutoJoinFailed
+
+                if isinstance(exc, AutoJoinFailed):
+                    raise
                 error(f"文档任务发送失败：账号={account_id} 群组发送异常 错误={exc}")
                 return False

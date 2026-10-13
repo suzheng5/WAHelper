@@ -94,7 +94,21 @@ def coerce_chat_key_set(value: Any) -> Set[str]:
     if isinstance(value, JID):
         return set(keys_for_match(value))
     if isinstance(value, str):
-        return keys_for_chat_ref(value)
+        s = (value or "").strip()
+        if not s:
+            return set()
+        low = s.lower()
+        # 已是 JID/规范化键：直接收入。禁止再走 keys_for_chat_ref，
+        # 否则当 _resolved_chat_keys 以 JID 自身为 key 时会无限递归。
+        if "@" in low:
+            return {low}
+        if low in _resolved_chat_keys:
+            return {
+                str(x).strip().lower()
+                for x in _resolved_chat_keys[low]
+                if str(x).strip()
+            }
+        return keys_for_chat_ref(s)
     out: Set[str] = set()
     if isinstance(value, (list, set, frozenset, tuple)):
         for item in value:
@@ -109,7 +123,12 @@ def keys_for_chat_ref(ref: str) -> Set[str]:
         return set()
     low = cr.lower()
     if low in _resolved_chat_keys:
-        return coerce_chat_key_set(_resolved_chat_keys[low])
+        # 缓存值已是规范化键；勿再 coerce→keys_for_chat_ref（会递归）
+        return {
+            str(x).strip().lower()
+            for x in _resolved_chat_keys[low]
+            if str(x).strip()
+        }
     if invite_code_from_link(cr):
         return set()
     try:

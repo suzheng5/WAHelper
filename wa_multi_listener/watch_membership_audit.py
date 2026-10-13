@@ -139,8 +139,9 @@ async def audit_address_book_watch_users(
             warning(f"成员检测「{label}」：{row.detail}")
             continue
         try:
+            group_ref = (ent.chat_ref or "").strip() or (ent.invite_link or "").strip()
             group_jid, group_client = await _resolve_group_jid_with_fallback(
-                clients, primary, owner, ent.chat_ref
+                clients, primary, owner, group_ref
             )
         except asyncio.TimeoutError:
             row = WatchAuditRow(

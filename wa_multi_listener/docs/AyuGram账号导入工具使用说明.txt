@@ -1,0 +1,41 @@
+TG 账号导入 AyuGram 工具
+=========================
+
+用途
+----
+将“超群小帮手”中已经登录的 Telegram 账号批量转换并导入同一个 AyuGram。
+不需要重新输入手机号、短信验证码或云密码；已经失效的 session 无法导入。
+
+使用步骤
+--------
+1. 完全退出“超群小帮手”和 AyuGram。
+2. 双击“TG账号导入AyuGram.exe”。
+3. 选择软件根目录：
+   此目录内应包含 telegram\config.json 和 telegram\sessions。
+4. 选择 AyuGram 根目录：
+   此目录内应包含 AyuGram.exe。
+5. 点击“开始导入全部账号”，等待完成。
+6. 导入完成后再启动 AyuGram。
+
+数据安全
+--------
+1. 工具仅在本机处理 session，不会上传登录数据。
+2. 原 Telethon session 使用只读 SQLite 快照，不会被修改。
+3. AyuGram 原 tdata 会自动备份为：
+   tdata_backup_年月日_时分秒
+4. 详细结果保存在 AyuGram 根目录：
+   AyuGram账号导入报告.json
+
+恢复原 AyuGram 数据
+-------------------
+1. 完全退出 AyuGram。
+2. 将当前 tdata 改名或移走。
+3. 将最近的 tdata_backup_年月日_时分秒 改名为 tdata。
+4. 重新启动 AyuGram。
+
+注意事项
+--------
+1. 转换时需要联网，以验证 session 是否仍然有效。
+2. 不要在转换过程中启动原软件或 AyuGram。
+3. 同一登录凭据不建议在不同公网 IP 下同时运行，Telegram 可能将其判定为重复授权。
+4. 请只转换和使用本人或已获得明确授权的账号。

@@ -5,7 +5,6 @@ import os
 import sys
 import traceback
 from pathlib import Path
-from tkinter import filedialog, messagebox
 from typing import Any, Callable, List, Optional
 
 import customtkinter as ctk
@@ -15,26 +14,29 @@ if str(_pkg_root) not in sys.path:
     sys.path.insert(0, str(_pkg_root))
 
 from config import load_config
+from app_version import APP_VERSION
 from legacy_tg_import import (
     default_legacy_tg_candidates,
     ensure_tg_data_ready,
     import_from_legacy_dir,
 )
-from logger_util import info
+from i18n import t
+from logger_util import error, error_i18n, info, info_i18n
 from platform_paths import combo_root, tg_data_root, wa_data_root
 from startup_bootstrap import bootstrap_wa_logging, bootstrap_wa_runtime
 from wa_ui.app import WaPanel
+from wa_ui.file_picker_util import pick_directory
+from wa_ui.modal_util import show_message
 from wa_ui.theme import COLORS
 
 MAIN_GEOMETRY = "1180x760"
-APP_VERSION = "v2.0.15"
 _AI_ROOT = _pkg_root.parent
 
 
 class MessengerShell(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
-        self.title(f"超群小帮手 {APP_VERSION} · WhatsApp + Telegram")
+        self.title(f"{t('app.brand')} {APP_VERSION} {t('app.title_suffix')}")
         self.geometry(MAIN_GEOMETRY)
         self.resizable(False, False)
         self.configure(fg_color=COLORS["bg"])
@@ -59,23 +61,36 @@ class MessengerShell(ctk.CTk):
         top.pack(fill="x")
         ctk.CTkLabel(
             top,
-            text="超群小帮手",
+            text=t("app.brand"),
             font=ctk.CTkFont(size=18, weight="bold"),
             text_color=COLORS["text"],
         ).pack(side="left", padx=16, pady=10)
         ctk.CTkButton(
             top,
-            text="导入 TG 登录与配置…",
+            text=t("shell.import_tg"),
             width=160,
             fg_color=COLORS["border"],
             command=self._import_legacy_tg,
         ).pack(side="right", padx=8, pady=8)
         ctk.CTkLabel(
             top,
-            text=f"数据：{combo_root()}",
+            text=t("shell.data_dir", path=combo_root()),
             font=ctk.CTkFont(size=11),
             text_color=COLORS["muted"],
         ).pack(side="right", padx=8)
+        try:
+            from license_service import check_license
+
+            _ok, lic_msg, _exp = check_license()
+            lic_color = COLORS["success"] if _ok else COLORS["danger"]
+            ctk.CTkLabel(
+                top,
+                text=lic_msg,
+                font=ctk.CTkFont(size=11),
+                text_color=lic_color,
+            ).pack(side="right", padx=8)
+        except Exception:
+            pass
 
         self._tabs = ctk.CTkTabview(self, fg_color=COLORS["bg"])
         self._tabs.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -106,21 +121,21 @@ class MessengerShell(ctk.CTk):
     def _import_legacy_tg(self) -> None:
         initial = default_legacy_tg_candidates()
         start = initial[0] if initial and os.path.isdir(initial[0]) else combo_root()
-        path = filedialog.askdirectory(
-            title="选择文件夹（内含 config.json 与 sessions 登录文件）",
+        path = pick_directory(
+            self,
+            title=t("shell.import_dir_title"),
             initialdir=start,
-            mustexist=True,
         )
         if not path:
             return
         ok, msg = import_from_legacy_dir(path)
         if ok:
-            messagebox.showinfo("导入完成", msg, parent=self)
+            show_message(self, t("shell.import_ok_title"), msg)
             info(msg)
             self._mount_tg_tab(force=True)
         else:
-            messagebox.showerror("导入失败", msg, parent=self)
-            info(f"导入失败：{msg}")
+            show_message(self, t("shell.import_fail_title"), msg)
+            info_i18n("shell.import_fail_log", msg=msg)
 
     def start_wa_backend(self) -> None:
         from listener import ListenerController
@@ -162,16 +177,13 @@ class MessengerShell(ctk.CTk):
         self._tab_tg.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
             box,
-            text="Telegram 界面加载失败",
+            text=t("shell.tg_load_fail"),
             font=ctk.CTkFont(size=18, weight="bold"),
             text_color=COLORS["danger"],
         ).pack(anchor="w", padx=16, pady=(16, 8))
         ctk.CTkLabel(
             box,
-            text=msg
-            + "\n\n请查看 telegram/logs/app.log。\n"
-            "新用户可直接在 Telegram 标签添加账号并登录；"
-            "有旧版数据时可用右上角「导入 TG 登录与配置」。",
+            text=msg + "\n\n" + t("shell.tg_load_hint"),
             font=ctk.CTkFont(size=13),
             text_color=COLORS["text"],
             justify="left",
@@ -215,13 +227,13 @@ class MessengerShell(ctk.CTk):
             self._tg_scheduler = scheduler
             self._tg_coord_holder = coord_holder
             self._tg_mounted = True
-            info("Telegram 标签页已挂载")
+            info_i18n("shell.tg_mounted")
         except Exception:
             from logger_util import error
 
             err = traceback.format_exc()
-            error(f"Telegram 标签加载失败：{err}")
-            self._show_tg_mount_error(err.strip().splitlines()[-1] if err else "未知错误")
+            error_i18n("shell.tg_load_error", err=err)
+            self._show_tg_mount_error(err.strip().splitlines()[-1] if err else t("common.unknown_error"))
 
     def _on_exit(self) -> None:
         if self._wa_panel is not None:
@@ -230,19 +242,22 @@ class MessengerShell(ctk.CTk):
             except Exception as exc:
                 from logger_util import error
 
-                error(f"退出 WA 时：{exc}")
+                error_i18n("shell.exit_wa_error", exc=exc)
         if self._tg_shutdown_fn is not None:
             try:
                 self._tg_shutdown_fn()
             except Exception as exc:
                 from logger_util import error
 
-                error(f"退出 TG 时：{exc}")
+                error_i18n("shell.exit_tg_error", exc=exc)
         self.destroy()
 
 
 def run_shell() -> MessengerShell:
+    from i18n import init_i18n
     from platform_paths import tg_data_root
+
+    init_i18n()
 
     os.environ.setdefault("TG_HELPER_DATA_ROOT", tg_data_root())
     bootstrap_wa_runtime()
@@ -251,7 +266,7 @@ def run_shell() -> MessengerShell:
     from neonize_bootstrap import install_patched_neonize_dll_if_present
 
     install_patched_neonize_dll_if_present()
-    info(f"整合助手启动（WA 数据：{wa_data_root()}，TG 数据：{tg_data_root()}）")
+    info_i18n("shell.combo_start", wa=wa_data_root(), tg=tg_data_root())
 
     app = MessengerShell()
     app.after(0, app.start_wa_backend)

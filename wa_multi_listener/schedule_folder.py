@@ -4,7 +4,9 @@ from __future__ import annotations
 import os
 import random
 import re
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
+
+from i18n import t
 
 _FOLDER_TXT_NUM = re.compile(r"^(\d+)")
 
@@ -24,7 +26,7 @@ def scan_schedule_folder(folder_path: str) -> Tuple[List[str], List[str]]:
     """扫描文件夹内 TXT：仅保留文件名以数字开头的，按数字升序。"""
     root = os.path.abspath((folder_path or "").strip())
     if not root or not os.path.isdir(root):
-        return [], ["路径不是有效文件夹"]
+        return [], [t("folder.scan_not_dir")]
     numbered: dict[int, str] = {}
     errors: List[str] = []
     for name in os.listdir(root):
@@ -39,13 +41,13 @@ def scan_schedule_folder(folder_path: str) -> Tuple[List[str], List[str]]:
             continue
         num = int(m.group(1))
         if num in numbered:
-            errors.append(f"重复天数编号 {num}：{numbered[num]} 与 {name}")
+            errors.append(t("folder.scan_dup_day", num=num, a=numbered[num], b=name))
         else:
             numbered[num] = name
     if errors:
         return [], errors
     if not numbered:
-        return [], ["文件夹内没有带数字前缀的 TXT（如 4.txt、11女二退.txt）；无数字前缀的文件已忽略"]
+        return [], [t("folder.scan_no_numbered")]
     ordered = [numbered[k] for k in sorted(numbered.keys())]
     return ordered, []
 
@@ -84,9 +86,51 @@ def read_folder_txt_utf8(folder_path: str, rel_name: str) -> Tuple[str, str]:
         with open(path, "r", encoding="utf-8") as f:
             return f.read(), ""
     except UnicodeDecodeError:
-        return "", "TXT 解码失败，请另存为 UTF-8 编码"
+        return "", t("folder.read_decode_fail")
     except OSError as exc:
-        return "", f"读取 TXT 失败：{exc}"
+        return "", t("folder.read_fail", err=exc)
+
+
+def folder_day_number_from_name(rel_name: str) -> Optional[int]:
+    """从「4.txt / 11女二退.txt」解析天数编号；失败返回 None。"""
+    stem = os.path.splitext((rel_name or "").strip())[0]
+    m = _FOLDER_TXT_NUM.match(stem)
+    if not m:
+        return None
+    return int(m.group(1))
+
+
+def index_for_day_number(files: List[str], day_num: int) -> Optional[int]:
+    for i, name in enumerate(files or []):
+        n = folder_day_number_from_name(name)
+        if n is not None and n == day_num:
+            return i
+    return None
+
+
+def rescan_folder_files_keep_day(job: Any) -> Tuple[List[str], int, str]:
+    """
+    重新扫描文件夹 TXT 列表，尽量保持当前「天数编号」。
+    返回 (新文件列表, 新下标, 错误)。
+    """
+    path = str(getattr(job, "folder_path", "") or "").strip()
+    ordered, errors = scan_schedule_folder(path)
+    if errors:
+        return [], 0, errors[0]
+    if not ordered:
+        return [], 0, t("folder.scan_no_numbered")
+    old_files = list(getattr(job, "folder_files", None) or [])
+    old_idx = max(0, int(getattr(job, "folder_day_index", 0) or 0))
+    day_num: Optional[int] = None
+    if 0 <= old_idx < len(old_files):
+        day_num = folder_day_number_from_name(old_files[old_idx])
+    new_idx = 0
+    if day_num is not None:
+        found = index_for_day_number(ordered, day_num)
+        new_idx = found if found is not None else min(old_idx, len(ordered) - 1)
+    else:
+        new_idx = min(old_idx, len(ordered) - 1)
+    return ordered, new_idx, ""
 
 
 def is_folder_job(job: Any) -> bool:
@@ -147,7 +191,13 @@ def split_folder_jobs_for_bulk_advance(jobs: List[Any]) -> Tuple[List[Any], List
 
 
 def format_folder_last_day_delete_line(*, target_label: str, current_name: str, day_one_based: int, total_days: int) -> str:
-    return f"· {target_label}：{current_name}（第 {day_one_based}/{total_days} 天，无下一天，将删除）"
+    return t(
+        "folder.last_day_delete",
+        target=target_label,
+        current=current_name,
+        day=day_one_based,
+        total=total_days,
+    )
 
 
 def _job_step_count(job: Any) -> int:
@@ -212,15 +262,15 @@ def format_bulk_delete_confirm_message(
     folder_kept: int,
     total_delete: int,
 ) -> str:
-    parts: List[str] = [f"将删除 {total_delete} 个任务："]
+    parts: List[str] = [t("folder.bulk_delete_header", total=total_delete)]
     if single_txt > 0:
-        parts.append(f"· {single_txt} 个单 TXT 文档任务")
+        parts.append(t("folder.bulk_delete_single", n=single_txt))
     if folder_done > 0:
-        parts.append(f"· {folder_done} 个已全部发完的文件夹任务")
+        parts.append(t("folder.bulk_delete_folder_done", n=folder_done))
     msg = "\n".join(parts)
     if folder_kept > 0:
-        msg += f"\n\n保留 {folder_kept} 个进行中的文件夹任务（未发完所有天数）。"
-    msg += "\n\n确定继续？"
+        msg += t("folder.bulk_delete_keep", n=folder_kept)
+    msg += t("folder.bulk_delete_confirm")
     return msg
 
 
@@ -230,9 +280,9 @@ def schedule_kind_badge(job: Any) -> str:
         total = folder_day_total(job)
         if total > 0:
             idx = max(0, int(getattr(job, "folder_day_index", 0) or 0))
-            return f" [文件夹·第{idx + 1}/{total}天]"
-        return " [文件夹]"
-    return " [单TXT]"
+            return t("folder.badge_folder_day", cur=idx + 1, total=total)
+        return t("folder.badge_folder")
+    return t("folder.badge_single")
 
 
 def _job_has_chat_entry(job: Any, entry_id: str) -> bool:
@@ -253,13 +303,13 @@ def entry_schedule_kind_hint(jobs: List[Any], entry_id: str) -> str:
 
 def taskmgr_job_file_label(job: Any) -> str:
     """任务卡片「文档：」行文案（位置不变，文件夹任务附加天数）。"""
-    name = (getattr(job, "source_name", None) or "").strip() or "未命名"
+    name = (getattr(job, "source_name", None) or "").strip() or t("folder.job_unnamed")
     if is_folder_job(job):
         total = folder_day_total(job)
         if total > 0:
             idx = max(0, int(getattr(job, "folder_day_index", 0) or 0))
-            return f"文档：{name}（第 {idx + 1}/{total} 天）"
-    return f"文档：{name}"
+            return t("folder.job_file_day", name=name, cur=idx + 1, total=total)
+    return t("folder.job_file", name=name)
 
 
 def format_folder_advance_line(
@@ -270,4 +320,11 @@ def format_folder_advance_line(
     next_day_one_based: int,
     total_days: int,
 ) -> str:
-    return f"· {target_label}：{current_name} → {next_name}（第 {next_day_one_based}/{total_days} 天）"
+    return t(
+        "folder.advance_line",
+        target=target_label,
+        current=current_name,
+        next=next_name,
+        day=next_day_one_based,
+        total=total_days,
+    )

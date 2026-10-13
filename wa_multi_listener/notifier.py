@@ -1,11 +1,13 @@
-"""顶置弹窗提醒。"""
+"""消息与阶段提醒：出现时置前一次，随后保持可并行操作。"""
 from __future__ import annotations
 
 from typing import Callable, Optional
 
 import customtkinter as ctk
 
+from i18n import t
 from wa_ui.theme import COLORS
+from wa_ui.window_policy import close_window, present_once
 
 _ALERT_GEOMETRY = "460x260"
 _ALERT_MINSIZE = (400, 220)
@@ -15,23 +17,8 @@ _LABEL_WRAP = 400
 
 
 def _setup_popup_window(win: ctk.CTkToplevel, master: ctk.CTk) -> None:
-    """弹窗跟随主窗口并保持置顶。"""
-    try:
-        win.transient(master.winfo_toplevel())
-    except Exception:
-        pass
-    try:
-        win.attributes("-topmost", True)
-    except Exception:
-        pass
-    try:
-        win.lift()
-    except Exception:
-        pass
-    try:
-        win.bell()
-    except Exception:
-        pass
+    """提醒出现时置前一次；不 grab、不长期置顶。"""
+    present_once(win, parent=master, bell=True, focus=False)
 
 
 class AlertPopup(ctk.CTkToplevel):
@@ -47,7 +34,7 @@ class AlertPopup(ctk.CTkToplevel):
     ) -> None:
         super().__init__(master)
         self._on_close = on_close
-        self.title("WhatsApp 消息提醒")
+        self.title(t("alert.title_wa"))
         self.configure(fg_color=COLORS["bg"])
         self.attributes("-alpha", 0.0)
         self.resizable(True, True)
@@ -61,7 +48,7 @@ class AlertPopup(ctk.CTkToplevel):
 
         ctk.CTkLabel(
             wrap,
-            text=chat_title or "会话",
+            text=chat_title or t("alert.session"),
             font=ctk.CTkFont(size=15, weight="bold"),
             text_color=COLORS["text"],
             anchor="w",
@@ -71,7 +58,7 @@ class AlertPopup(ctk.CTkToplevel):
 
         ctk.CTkLabel(
             wrap,
-            text=sender_name or "用户",
+            text=sender_name or t("alert.user"),
             font=ctk.CTkFont(size=12),
             text_color=COLORS["muted"],
             anchor="w",
@@ -95,7 +82,7 @@ class AlertPopup(ctk.CTkToplevel):
 
         ctk.CTkButton(
             wrap,
-            text="关闭",
+            text=t("alert.close"),
             width=100,
             fg_color=COLORS["border"],
             hover_color=COLORS["card"],
@@ -111,9 +98,11 @@ class AlertPopup(ctk.CTkToplevel):
             self.after(20, lambda: self._fade_in_step(step + 1))
 
     def _close(self) -> None:
-        if self._on_close:
-            self._on_close()
-        self.destroy()
+        try:
+            if self._on_close:
+                self._on_close()
+        finally:
+            close_window(self)
 
 
 class StageReminderPopup(ctk.CTkToplevel):
@@ -121,7 +110,7 @@ class StageReminderPopup(ctk.CTkToplevel):
 
     def __init__(self, master: ctk.CTk, *, title: str, subtitle: str, body: str) -> None:
         super().__init__(master)
-        self.title(title or "阶段提醒")
+        self.title(title or t("stage.default_title"))
         self.configure(fg_color=COLORS["bg"])
         self.attributes("-alpha", 0.0)
         self.resizable(True, True)
@@ -135,7 +124,7 @@ class StageReminderPopup(ctk.CTkToplevel):
 
         ctk.CTkLabel(
             wrap,
-            text=title or "阶段提醒",
+            text=title or t("stage.default_title"),
             font=ctk.CTkFont(size=15, weight="bold"),
             text_color=COLORS["accent"],
             anchor="w",
@@ -170,7 +159,7 @@ class StageReminderPopup(ctk.CTkToplevel):
 
         ctk.CTkButton(
             wrap,
-            text="知道了",
+            text=t("stage.got_it"),
             width=100,
             fg_color=COLORS["accent"],
             hover_color="#1da851",
@@ -185,7 +174,7 @@ class StageReminderPopup(ctk.CTkToplevel):
             self.after(20, lambda: self._fade_in_step(step + 1))
 
     def _close(self) -> None:
-        self.destroy()
+        close_window(self)
 
 
 def show_stage_reminder(master: ctk.CTk, *, title: str, subtitle: str, body: str) -> None:

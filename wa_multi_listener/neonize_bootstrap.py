@@ -27,11 +27,9 @@ def install_patched_neonize_dll_if_present() -> None:
     src = os.path.join(app_root(), name)
     if not os.path.isfile(src):
         return
-    # 打包版：DLL 已在 exe 旁，无需覆盖 _internal（避免文件占用 WinError 32）
+    # 打包版：neonize 直接从 _internal 加载，禁止运行时覆盖（易触发 Permission denied / WinError 32）
     if getattr(sys, "frozen", False):
-        bundled = os.path.join(app_root(), name)
-        if os.path.isfile(bundled):
-            return
+        return
     spec = importlib.util.find_spec("neonize")
     if not spec or not spec.origin:
         warning("未找到 neonize 包，无法安装补丁 DLL")

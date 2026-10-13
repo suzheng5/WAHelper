@@ -6,43 +6,42 @@ import os
 from datetime import date
 from threading import Lock
 
-from .compat_config import DATA_DIR, ensure_dirs
+from .config import data_dir, ensure_dirs
 
-STATS_FILE = os.path.join(DATA_DIR, "stats.json")
 _lock = Lock()
 
 
-def _path() -> str:
+def _stats_path() -> str:
     ensure_dirs()
-    return STATS_FILE
+    return os.path.join(data_dir(), "stats.json")
 
 
 def record_alert() -> None:
     today = str(date.today())
     with _lock:
         data = {"day": today, "count": 0}
-        if os.path.isfile(_path()):
+        if os.path.isfile(_stats_path()):
             try:
-                with open(_path(), "r", encoding="utf-8") as f:
+                with open(_stats_path(), "r", encoding="utf-8") as f:
                     data = json.load(f)
             except (json.JSONDecodeError, OSError):
                 pass
         if data.get("day") != today:
             data = {"day": today, "count": 0}
         data["count"] = int(data.get("count", 0)) + 1
-        tmp = _path() + ".tmp"
+        tmp = _stats_path() + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, _path())
+        os.replace(tmp, _stats_path())
 
 
 def today_alert_count() -> int:
     today = str(date.today())
     with _lock:
-        if not os.path.isfile(_path()):
+        if not os.path.isfile(_stats_path()):
             return 0
         try:
-            with open(_path(), "r", encoding="utf-8") as f:
+            with open(_stats_path(), "r", encoding="utf-8") as f:
                 data = json.load(f)
         except (json.JSONDecodeError, OSError):
             return 0

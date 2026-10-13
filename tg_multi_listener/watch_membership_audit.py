@@ -82,7 +82,7 @@ async def audit_address_book_watch_users(
             out[eid] = WatchAuditRow(eid, WatchAuditStatus.ERROR, str(exc))
             continue
         label = (ent.remark or ent.id).strip()
-        ref = (ent.chat_ref or "").strip()
+        ref = (ent.chat_ref or "").strip() or (ent.invite_link or "").strip()
         peer_id: Optional[int] = chat_ref_to_optional_int(ref)
         if peer_id is None:
             try:

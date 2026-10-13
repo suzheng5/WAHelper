@@ -26,6 +26,7 @@ from .config import _parse_watch_rule_value
 from .logger_util import error, info, warning
 
 AlertPayload = Dict[str, Any]
+AddressGroupWarning = Callable[[str, str, int], None]
 
 _last_alert_ts: Dict[int, float] = {}
 _seen_msgs: Dict[Tuple[int, int], float] = {}
@@ -193,20 +194,62 @@ async def _resolve_chat_ref(
             n = int(s0)
         except ValueError:
             return None
-        try:
-            ent = await client.get_entity(n)
-            return int(utils.get_peer_id(ent))
-        except Exception:
-            if skip_dialogs_fallback:
-                return int(n)
+        candidates = [n]
+        marked = int(f"-100{abs(n)}")
+        if not str(n).startswith("-100") and marked != n:
+            candidates.append(marked)
+
+        last_error: Optional[Exception] = None
+        for candidate in candidates:
             try:
-                await client.get_dialogs(limit=500)
-                ent = await client.get_entity(n)
+                ent = await client.get_entity(candidate)
                 return int(utils.get_peer_id(ent))
             except Exception as exc:
-                if not quiet:
-                    warning(f"解析群/频道 ID「{s0}」失败：{exc}")
-                return None
+                last_error = exc
+        if not skip_dialogs_fallback:
+            try:
+                await client.get_dialogs(limit=500)
+                for candidate in candidates:
+                    try:
+                        ent = await client.get_entity(candidate)
+                        return int(utils.get_peer_id(ent))
+                    except Exception as exc:
+                        last_error = exc
+            except Exception as exc:
+                last_error = exc
+        # 已是规范 -100… 时，即使当前账号暂时无法取实体，也可保留原 ID；
+        # 缺少 -100 的数字不能继续冒充普通 Chat，否则发送时会触发 PeerInvalid。
+        if str(n).startswith("-100"):
+            return int(n)
+        if not quiet:
+            warning(f"解析群/频道 ID「{s0}」失败：{last_error or '未找到对应会话'}")
+        return None
+
+    # 私密邀请链接：仅当该账号已在群内时可由 CheckChatInvite 得到 ID
+    try:
+        from .group_auto_join import tg_invite_hash
+
+        inv = tg_invite_hash(s0)
+    except Exception:
+        inv = None
+    if inv:
+        try:
+            from telethon.tl.functions.messages import CheckChatInviteRequest
+            from telethon.tl.types import ChatInviteAlready
+
+            res = await client(CheckChatInviteRequest(inv))
+            if isinstance(res, ChatInviteAlready) and getattr(res, "chat", None) is not None:
+                return int(utils.get_peer_id(res.chat))
+            if not quiet:
+                warning(
+                    f"邀请链接「{s0}」尚未被当前账号加入，无法解析群 ID"
+                    "（入群成功后会自动写回）"
+                )
+        except Exception as exc:
+            if not quiet:
+                warning(f"解析邀请链接失败「{s0}」：{exc}")
+        return None
+
     s = s0
     uname = s[1:] if s.startswith("@") else s
     uname = uname.strip()
@@ -333,8 +376,15 @@ class AddressBookResolver:
         ref = (ent.chat_ref or "").strip()
         if not ref:
             return False
-        # 已是数字 ID 则无需再解析；@ / 链接 须转成数字并写回 config
-        return chat_ref_to_optional_int(ref) is None
+        n = chat_ref_to_optional_int(ref)
+        if n is None:
+            return True
+        # 缺少 -100 的数字必须在线辨别：先按普通群解析，失败后再尝试
+        # -100{raw_id}；规范 ID 的新增/变更条目也解析一次以验证实体类型。
+        if not str(int(n)).startswith("-100"):
+            return True
+        cached = self._entry_cache.get(ent.id)
+        return cached is None or cached.chat_fp != self._chat_fp(ent)
 
     async def _resolve_entry_chat(
         self,
@@ -348,9 +398,6 @@ class AddressBookResolver:
         ref = (ent.chat_ref or "").strip()
         if not ref:
             return None
-        n = chat_ref_to_optional_int(ref)
-        if n is not None:
-            return int(n)
         try:
             chat_ref = parse_chat_ref_input(ref)
         except ValueError as exc:
@@ -367,6 +414,33 @@ class AddressBookResolver:
             skip_dialogs_fallback=self._dialogs_warmed,
         )
 
+    async def _classify_group(
+        self,
+        client: TelegramClient,
+        ent: AddressEntry,
+        clients_by_id: Dict[str, TelegramClient],
+        peer_id: int,
+    ) -> str:
+        """返回 supergroup / channel / basic_group / unknown。"""
+        from telethon.tl.types import Channel, Chat
+
+        owner_id = (ent.owner_account_id or "").strip()
+        clients = _resolution_clients_ordered(client, clients_by_id, owner_id)
+        for _label, candidate in clients:
+            try:
+                entity = await candidate.get_entity(int(peer_id))
+            except Exception:
+                continue
+            if isinstance(entity, Channel):
+                if bool(getattr(entity, "megagroup", False)) or bool(
+                    getattr(entity, "gigagroup", False)
+                ):
+                    return "supergroup"
+                return "channel"
+            if isinstance(entity, Chat):
+                return "basic_group"
+        return "unknown"
+
     async def resolve_address_book_refs(
         self,
         client: TelegramClient,
@@ -374,6 +448,7 @@ class AddressBookResolver:
         clients_by_id: Dict[str, TelegramClient],
         *,
         full: bool = False,
+        on_non_supergroup: Optional[AddressGroupWarning] = None,
     ) -> bool:
         """将 @用户名 / 链接 转为数字群 ID 并写回 config；full=False 时只解析新增或变更条目。"""
         self._prune_entry_cache(cfg)
@@ -394,12 +469,29 @@ class AddressBookResolver:
             )
             if cid is None:
                 continue
+            if on_non_supergroup is not None:
+                kind = await self._classify_group(client, ent, clients_by_id, cid)
+                if kind in ("basic_group", "channel"):
+                    try:
+                        on_non_supergroup(str(label), kind, int(cid))
+                    except Exception:
+                        pass
             new_ref = str(int(cid))
             old_ref = (ent.chat_ref or "").strip()
             if new_ref != old_ref:
+                try:
+                    from .group_auto_join import tg_invite_hash
+
+                    if tg_invite_hash(old_ref) and not (ent.invite_link or "").strip():
+                        ent.invite_link = old_ref
+                except Exception:
+                    pass
                 ent.chat_ref = new_ref
                 changed = True
-                info(f"通讯录「{label}」群已解析为 ID {new_ref}")
+                info(
+                    f"通讯录「{label}」群已解析为 ID {new_ref}"
+                    + ("（已保留邀请链接）" if (ent.invite_link or "").strip() else "")
+                )
             cached = self._entry_cache.get(ent.id) or _EntryResolveCache()
             cached.peer_id = cid
             cached.chat_fp = self._chat_fp(ent)
@@ -580,10 +672,17 @@ async def resolve_address_book_refs_with_owner_retry(
     *,
     resolver: Optional[AddressBookResolver] = None,
     full: bool = True,
+    on_non_supergroup: Optional[AddressGroupWarning] = None,
 ) -> bool:
     """在线解析通讯录群标识；主账号失败时，自动用该群归属账号重试一次。"""
     r = resolver or AddressBookResolver()
-    return await r.resolve_address_book_refs(client, cfg, clients_by_id, full=full)
+    return await r.resolve_address_book_refs(
+        client,
+        cfg,
+        clients_by_id,
+        full=full,
+        on_non_supergroup=on_non_supergroup,
+    )
 
 
 async def _resolve_watch_rules(
@@ -617,27 +716,37 @@ class ListenerController:
         """登记监听意图；实际连接与事件由 telethon_coordinator 在同一 asyncio 循环内完成。"""
         self.stop()
         self._alert_cb = alert_cb
-        self._listen_enabled = False
         self._running = False
+        if self.apply_config(cfg):
+            info("已登记监听规则（与定时任务共享会话，由统一线程连接 Telegram）")
+
+    def apply_config(self, cfg: AppConfig) -> bool:
+        """按最新配置同步监听开关（热更新用，不 stop）。返回是否应解析/注册规则。"""
+        self._listen_enabled = False
+        self._rate_seconds = float(getattr(cfg, "rate_limit_seconds", self._rate_seconds) or 0)
         if not cfg.listening_enabled:
+            self.set_watch_rules({})
             info("监听未开启（配置中 listening_enabled=false）")
-            return
+            return False
         accounts = [a for a in cfg.accounts if a.enabled]
         if not accounts:
+            self.set_watch_rules({})
             warning("没有已启用账号，未启动监听事件（仍可连接账号用于定时发送）")
-            return
+            return False
         ok_bind = False
         for _a, _b in iter_listen_bindings(cfg):
             ok_bind = True
             break
         if not ok_bind:
+            self.set_watch_rules({})
             warning("未配置监听绑定（通讯录中无「参与监听」条目或旧版 watch_rules 为空），不注册监听事件")
-            return
+            return False
         if not int(cfg.api_id) or not str(cfg.api_hash).strip():
+            self.set_watch_rules({})
             warning("未配置共用的 api_id / api_hash，无法注册监听")
-            return
+            return False
         self._listen_enabled = True
-        info("已登记监听规则（与定时任务共享会话，由统一线程连接 Telegram）")
+        return True
 
     def listen_enabled(self) -> bool:
         return self._listen_enabled

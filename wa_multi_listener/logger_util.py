@@ -7,7 +7,7 @@ from collections import deque
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from threading import Lock
-from typing import Callable, Deque, List, Optional
+from typing import Callable, Deque, List, Optional, Any
 
 from config import LOGS_DIR, ensure_dirs
 
@@ -60,6 +60,28 @@ def warning(msg: str) -> None:
 
 def error(msg: str) -> None:
     log_line(logging.ERROR, msg)
+
+
+def _log_i18n(level: int, key: str, **kwargs: Any) -> None:
+    try:
+        from i18n import t
+
+        msg = t(key, **kwargs)
+    except Exception:
+        msg = key
+    log_line(level, msg)
+
+
+def info_i18n(key: str, **kwargs: Any) -> None:
+    _log_i18n(logging.INFO, key, **kwargs)
+
+
+def warning_i18n(key: str, **kwargs: Any) -> None:
+    _log_i18n(logging.WARNING, key, **kwargs)
+
+
+def error_i18n(key: str, **kwargs: Any) -> None:
+    _log_i18n(logging.ERROR, key, **kwargs)
 
 
 def get_recent_lines(limit: int = 200) -> List[str]:

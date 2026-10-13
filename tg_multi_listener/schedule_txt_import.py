@@ -35,8 +35,10 @@ def _split_blocks(text: str) -> List[str]:
 # 键值分隔符含半角/全角冒号、等号（输入法常打出 账号＝xxx）
 _KV_LINE = re.compile(r"^([^:：=＝]+)\s*[:：=＝]\s*(.*)$")
 _REMINDER_HEAD = re.compile(r"^\s*[!！]\s*提醒\s*[!！]\s*$", re.IGNORECASE)
+_IMAGE_HEAD = re.compile(r"^\s*[!！]\s*发图\s*[!！]\s*$", re.IGNORECASE)
 _DELAY_KEYS = frozenset({"间隔", "interval", "延迟", "delay", "间隔分钟", "等待", "等待分钟"})
 _REACTION_KEYS = frozenset({"点赞", "like", "反应", "react"})
+_IMAGE_TYPE_VALS = frozenset({"发图", "图片", "image", "img", "photo", "sendimage", "send_image"})
 _REACTION_ONLY_LINE = re.compile(r"^\s*点赞\s*$", re.IGNORECASE)
 
 
@@ -129,10 +131,83 @@ def _try_parse_reminder_block(block: str) -> Optional[DocMessage]:
     )
 
 
+def _is_image_type_value(v: str) -> bool:
+    raw = (v or "").strip()
+    if not raw:
+        return False
+    if raw in _IMAGE_TYPE_VALS:
+        return True
+    return _norm_key(raw) in {_norm_key(x) for x in _IMAGE_TYPE_VALS}
+
+
+def _try_parse_image_send_block(block: str) -> Optional[DocMessage]:
+    """类型=发图 / !发图!：需账号；备注可选；不要求消息正文。"""
+    account_val = ""
+    note = ""
+    message_val = ""
+    delay_m: Optional[float] = 0.0
+    delay_from_txt = False
+    has_marker = False
+    for raw in block.splitlines():
+        s = raw.strip()
+        if not s or s.startswith("#") or s.startswith("//"):
+            continue
+        if _IMAGE_HEAD.match(s):
+            has_marker = True
+            continue
+        m = _KV_LINE.match(s)
+        if not m:
+            return None
+        k = _norm_key(m.group(1))
+        v = m.group(2).strip()
+        if k in ("账号", "account", "发送账号"):
+            account_val = v
+        elif k in ("消息", "内容", "message", "text", "msg"):
+            message_val = v
+        elif k in ("备注", "说明", "提示", "note", "caption"):
+            note = v
+        elif _norm_key(k) in _DELAY_KEYS:
+            parsed = _parse_delay_minutes_value(v)
+            if parsed is None:
+                return None
+            delay_m = parsed
+            delay_from_txt = True
+        elif k in ("类型", "kind", "type"):
+            if _is_image_type_value(v):
+                has_marker = True
+            else:
+                return None
+        else:
+            return None
+    if not has_marker:
+        return None
+    if not account_val.strip():
+        return None
+    if message_val.strip():
+        note = f"{note}\n{message_val}".strip() if note else message_val
+    d = 0.0 if delay_m is None else float(delay_m)
+    acc = account_val.strip()
+    return DocMessage(
+        account_id=acc,
+        content="",
+        is_reminder=False,
+        reminder_note=note,
+        delay_after_minutes=d,
+        original_account_id=acc,
+        send_as_account_id=acc,
+        interval_from_txt=delay_from_txt,
+        want_reactions=False,
+        is_image_send=True,
+    )
+
+
 def _parse_block(block: str, *, require_per_item_interval: bool = True) -> Tuple[Optional[DocMessage], Optional[str]]:
     rem = _try_parse_reminder_block(block)
     if rem is not None:
         return rem, None
+    img = _try_parse_image_send_block(block)
+    if img is not None:
+        return img, None
     lines = block.splitlines()
     account = ""
     content = ""
@@ -222,7 +297,7 @@ def _parse_block(block: str, *, require_per_item_interval: bool = True) -> Tuple
 
 def items_use_txt_intervals(items: List[DocMessage]) -> bool:
     """所有发送条目均在 TXT 中写了 间隔= 时返回 True。"""
-    sends = [it for it in items if not it.is_reminder]
+    sends = [it for it in items if not it.is_non_send_step()]
     if not sends:
         return False
     return all(getattr(it, "interval_from_txt", False) for it in sends)
@@ -230,7 +305,7 @@ def items_use_txt_intervals(items: List[DocMessage]) -> bool:
 
 def items_have_any_txt_interval(items: List[DocMessage]) -> bool:
     """至少有一条发送条目在 TXT 中写了 间隔=。"""
-    return any(getattr(it, "interval_from_txt", False) for it in items if not it.is_reminder)
+    return any(getattr(it, "interval_from_txt", False) for it in items if not it.is_non_send_step())
 
 
 def import_doc_items(

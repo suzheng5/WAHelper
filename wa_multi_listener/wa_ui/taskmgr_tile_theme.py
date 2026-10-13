@@ -6,10 +6,23 @@ from typing import Any, TypedDict
 
 import customtkinter as ctk
 
+from i18n.pause_reason import (
+    CODE_AWAIT_IMAGE_SEND,
+    CODE_JOIN_GROUP_FAILED,
+    CODE_LISTEN_HIT,
+    CODE_STAGE_LISTEN_HIT,
+    CODE_STAGE_REMINDER,
+    CODE_STOPPED_LISTEN_HIT,
+    compose_listen_pause_reason,
+    normalize_pause_reason,
+    resolve_listen_pause_reason,
+)
+
 TaskmgrBucket = str  # running | listen_pause | stage_listen_pause | stopped_listen_pause | other_pause | stopped
 
-STAGE_LISTEN_HIT_PAUSE_REASON = "阶段提醒后监听命中，自动暂停"
-STOPPED_LISTEN_HIT_PAUSE_REASON = "已停止任务监听命中，请关注"
+# 向后兼容：旧代码 import 的常量现为原因码
+STAGE_LISTEN_HIT_PAUSE_REASON = CODE_STAGE_LISTEN_HIT
+STOPPED_LISTEN_HIT_PAUSE_REASON = CODE_STOPPED_LISTEN_HIT
 
 _TASKMGR_FONTS: dict[str, ctk.CTkFont] | None = None
 
@@ -54,7 +67,6 @@ _LISTEN_PAUSE: TaskmgrTilePalette = {
     "hint": "#ececec",
 }
 
-# 阶段提醒暂停后又被监听命中：紫色，与金/红/绿/灰均区分
 _STAGE_LISTEN_PAUSE: TaskmgrTilePalette = {
     "fg": "#2a1848",
     "border": "#9b59b6",
@@ -65,7 +77,6 @@ _STAGE_LISTEN_PAUSE: TaskmgrTilePalette = {
     "hint": "#ececec",
 }
 
-# 已停止任务再被监听命中：青蓝，与金色「运行中监听」、紫色「提醒+监听」区分
 _STOPPED_LISTEN_PAUSE: TaskmgrTilePalette = {
     "fg": "#123a4a",
     "border": "#1abc9c",
@@ -87,59 +98,60 @@ _OTHER_PAUSE: TaskmgrTilePalette = {
 }
 
 
+def _code(pause_reason: str) -> str:
+    return normalize_pause_reason(pause_reason)
+
+
 def _is_stopped_listen_pause(pause_reason: str) -> bool:
-    r = (pause_reason or "").strip()
-    if _is_stage_listen_pause(r):
-        return False
-    return "已停止" in r and "监听命中" in r
+    return _code(pause_reason) == CODE_STOPPED_LISTEN_HIT
 
 
 def _is_listen_hit_pause(pause_reason: str) -> bool:
-    r = (pause_reason or "").strip()
-    if _is_stage_listen_pause(r) or _is_stopped_listen_pause(r):
+    c = _code(pause_reason)
+    if c in (CODE_STAGE_LISTEN_HIT, CODE_STOPPED_LISTEN_HIT):
         return False
-    return "监听命中" in r
+    return c == CODE_LISTEN_HIT
 
 
 def _is_stage_listen_pause(pause_reason: str) -> bool:
-    r = (pause_reason or "").strip()
-    return "阶段提醒" in r and "监听命中" in r
+    return _code(pause_reason) == CODE_STAGE_LISTEN_HIT
 
 
 def _is_stage_reminder_pause(pause_reason: str) -> bool:
-    r = (pause_reason or "").strip()
-    if _is_stage_listen_pause(r):
-        return False
-    return "阶段提醒" in r and "已自动暂停" in r
+    return _code(pause_reason) == CODE_STAGE_REMINDER
 
 
-def compose_listen_pause_reason(previous_reason: str, listen_reason: str) -> str:
-    """阶段提醒已暂停的任务再被监听命中时，使用组合原因以触发专用卡片色。"""
-    prev = (previous_reason or "").strip()
-    if _is_stage_listen_pause(prev):
-        return prev or STAGE_LISTEN_HIT_PAUSE_REASON
-    if "阶段提醒" in prev and "已自动暂停" in prev:
-        return STAGE_LISTEN_HIT_PAUSE_REASON
-    return (listen_reason or "").strip() or "监听命中目标用户，自动暂停"
+def _is_join_group_failed_pause(pause_reason: str) -> bool:
+    return _code(pause_reason) == CODE_JOIN_GROUP_FAILED
 
 
-def resolve_listen_pause_reason(*, enabled: bool, previous_reason: str, listen_reason: str) -> str:
-    """根据任务是否仍在启用，生成监听命中后的暂停原因文案。"""
-    if not enabled:
-        return STOPPED_LISTEN_HIT_PAUSE_REASON
-    return compose_listen_pause_reason(previous_reason, listen_reason)
+def _is_await_image_pause(pause_reason: str) -> bool:
+    """纯待发图（红）；不含「待发图+监听」（紫）。"""
+    return _code(pause_reason) == CODE_AWAIT_IMAGE_SEND
+
+
+def _is_await_image_listen_pause(pause_reason: str) -> bool:
+    from i18n.pause_reason import CODE_AWAIT_IMAGE_LISTEN_HIT
+
+    return _code(pause_reason) == CODE_AWAIT_IMAGE_LISTEN_HIT
 
 
 def taskmgr_display_sort_tier(*, running: bool, enabled: bool, pause_reason: str = "") -> int:
-    """任务管理页排序层级（越小越靠前）：监听/提醒+监听 > 阶段提醒 > 其它暂停 > 其余。"""
-    r = (pause_reason or "").strip()
-    if _is_stage_listen_pause(r) or _is_stopped_listen_pause(r) or _is_listen_hit_pause(r):
+    """任务管理页排序层级（越小越靠前）：监听类 > 阶段提醒/待发图 > 其它暂停 > 其余。"""
+    if (
+        _is_stage_listen_pause(pause_reason)
+        or _is_stopped_listen_pause(pause_reason)
+        or _is_listen_hit_pause(pause_reason)
+        or _is_await_image_listen_pause(pause_reason)
+    ):
         return 0
     if running:
         return 3
     if not enabled:
         return 3
-    if _is_stage_reminder_pause(r):
+    if _is_stage_reminder_pause(pause_reason) or _is_await_image_pause(pause_reason) or _is_join_group_failed_pause(
+        pause_reason
+    ):
         return 1
     return 2
 
@@ -176,7 +188,7 @@ def taskmgr_sort_jobs_for_display(
 def taskmgr_job_bucket(*, running: bool, enabled: bool, pause_reason: str = "") -> TaskmgrBucket:
     if running:
         return "running"
-    if _is_stage_listen_pause(pause_reason):
+    if _is_stage_listen_pause(pause_reason) or _is_await_image_listen_pause(pause_reason):
         return "stage_listen_pause"
     if _is_stopped_listen_pause(pause_reason):
         return "stopped_listen_pause"
@@ -184,6 +196,7 @@ def taskmgr_job_bucket(*, running: bool, enabled: bool, pause_reason: str = "") 
         return "listen_pause"
     if not enabled:
         return "stopped"
+    # 纯待发图 / 阶段提醒 → 红（other_pause）
     return "other_pause"
 
 
@@ -228,21 +241,23 @@ def taskmgr_count_jobs(
 
 
 def format_taskmgr_count_summary(counts: dict[str, int]) -> str:
+    from i18n import t
+
     total = counts.get("total", 0)
     if total <= 0:
-        return "任务数量：0"
-    parts = [f"任务数量：{total}"]
-    for key, label in (
-        ("running", "运行中"),
-        ("stage_listen_pause", "提醒+监听"),
-        ("stopped_listen_pause", "已停+监听"),
-        ("listen_pause", "监听暂停"),
-        ("other_pause", "其它暂停"),
-        ("stopped", "已停止"),
+        return t("taskmgr.count.total", total=0)
+    parts = [t("taskmgr.count.total", total=total)]
+    for key, label_key in (
+        ("running", "taskmgr.count.running"),
+        ("stage_listen_pause", "taskmgr.count.stage_listen_pause"),
+        ("stopped_listen_pause", "taskmgr.count.stopped_listen_pause"),
+        ("listen_pause", "taskmgr.count.listen_pause"),
+        ("other_pause", "taskmgr.count.other_pause"),
+        ("stopped", "taskmgr.count.stopped"),
     ):
         n = counts.get(key, 0)
         if n:
-            parts.append(f"{label} {n}")
+            parts.append(f"{t(label_key)} {n}")
     return " · ".join(parts)
 
 

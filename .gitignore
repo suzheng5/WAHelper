@@ -21,6 +21,15 @@
 **/data/
 **/logs/
 **/userdata_preserve/
+**/license_ws.dat
+**/license_admin.json
+**/license_public.json
+**/license_records.txt
+**/tg_verify.json
+**/ui_locale.json
+**/ui_column_widths.json
+**/*restore_result*.json
+**/*.csv
 
 # 打包与备份
 **/dist/

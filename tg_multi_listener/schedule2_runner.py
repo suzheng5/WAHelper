@@ -26,7 +26,13 @@ from .compat_config import (
 )
 from .logger_util import error, info, warning
 from .scheduler import DocMessage, _resolve_entity_for_send, send_telegram_message_resilient
-from .watch_read_tracker import TgWatchReadTracker, mark_watch_read_before_send
+from ..watch_read_tracker import TgWatchReadTracker, mark_watch_read_before_send
+
+from i18n.pause_reason import (
+    CODE_MANUAL,
+    CODE_ROUND_COMPLETE,
+    CODE_STARTUP_SCHEDULE2_TG,
+)
 
 
 @dataclass
@@ -231,7 +237,7 @@ def save_schedule2_state(s: Schedule2Job) -> None:
     save_schedule2_jobs(jobs)
 
 
-STARTUP_PAUSE_REASON_S2 = "程序启动后已自动暂停，请在「定时任务2」中点「继续」后再运行。"
+STARTUP_PAUSE_REASON_S2 = CODE_STARTUP_SCHEDULE2_TG
 
 
 def pause_all_schedule2_jobs_on_startup(reason: str = STARTUP_PAUSE_REASON_S2) -> int:
@@ -354,7 +360,7 @@ class Schedule2Runner:
     def stop(self) -> None:
         self._running = False
 
-    def pause_job(self, job_id: str, reason: str = "手动暂停") -> bool:
+    def pause_job(self, job_id: str, reason: str = CODE_MANUAL) -> bool:
         jobs = load_schedule2_jobs()
         now = time.time()
         changed = False
@@ -395,7 +401,7 @@ class Schedule2Runner:
         return changed
 
     # 兼容旧 UI / 调用
-    def pause_session(self, reason: str = "手动暂停") -> bool:
+    def pause_session(self, reason: str = CODE_MANUAL) -> bool:
         jobs = load_schedule2_jobs()
         ok = False
         for j in jobs:
@@ -487,7 +493,7 @@ class Schedule2Runner:
                     if j.cursor < 0 or j.cursor >= len(j.rows):
                         j.enabled = False
                         j.state = "paused"
-                        j.pause_reason = "一轮发送完成，任务自动停止"
+                        j.pause_reason = CODE_ROUND_COMPLETE
                         j.next_send_ts = 0.0
                         changed = True
                         continue
@@ -506,7 +512,7 @@ class Schedule2Runner:
                         if j.cursor >= len(j.rows):
                             j.enabled = False
                             j.state = "paused"
-                            j.pause_reason = "一轮发送完成，任务自动停止"
+                            j.pause_reason = CODE_ROUND_COMPLETE
                             j.next_send_ts = 0.0
                         else:
                             j.next_send_ts = time.time() + _next_delay_seconds(j)
@@ -536,7 +542,7 @@ class Schedule2Runner:
                         if j.cursor >= len(j.rows):
                             j.enabled = False
                             j.state = "paused"
-                            j.pause_reason = "一轮发送完成，任务自动停止"
+                            j.pause_reason = CODE_ROUND_COMPLETE
                             j.next_send_ts = 0.0
                     else:
                         j.last_error = "发送失败，已按下一轮间隔重试"
@@ -585,10 +591,18 @@ class Schedule2Runner:
                         await mark_watch_read_before_send(
                             client, account_id, entity, self._read_tracker
                         )
-                        from send_typing_util import telegram_typing_before_send
+                        from send_typing_util import telegram_send_with_typing
 
-                        await telegram_typing_before_send(client, entity, content)
-                        await send_telegram_message_resilient(client, entity, content)
+                        sent = await telegram_send_with_typing(
+                            client,
+                            entity,
+                            content,
+                            lambda: send_telegram_message_resilient(
+                                client, entity, content
+                            ),
+                        )
+                        if sent is None:
+                            return False
                         ok = True
                     except Exception as exc:
                         error(f"定时任务2 发送失败：账号={account_id} 群={cref} 错误={exc}")

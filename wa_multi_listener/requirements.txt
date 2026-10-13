@@ -1,4 +1,7 @@
-neonize>=0.3.18
+# 0.4.x 在 Windows/PyInstaller 下创建首个 NewAClient 时会触发原生进程崩溃。
+# v3.0.17 的生产包使用此精确版本，已验证可同时运行 TG 与多账号 WS。
+neonize==0.3.18.post0
 customtkinter>=5.2.0
 segno>=1.6.0
 Pillow>=10.0.0
+PySide6==6.11.1

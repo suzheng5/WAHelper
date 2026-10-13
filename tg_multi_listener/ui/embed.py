@@ -64,7 +64,7 @@ def mount_tg_panel(
 
     from tg_multi_listener.compat_config import load_config
     from tg_multi_listener.listener import ListenerController
-    from tg_multi_listener.logger_util import error, info
+    from tg_multi_listener.logger_util import error, error_i18n, info, info_i18n
     from tg_multi_listener.scheduler import ScheduleRunner, pause_all_doc_jobs_on_startup
     from tg_multi_listener.ui.app import MainWindow
 
@@ -72,7 +72,7 @@ def mount_tg_panel(
 
     bootstrap_tg_runtime()
     bootstrap_tg_logging()
-    info("Telegram 助手（整合标签）")
+    info_i18n("embed.tg_mounted")
 
     pause_all_doc_jobs_on_startup()
     listener = ListenerController()
@@ -92,10 +92,10 @@ def mount_tg_panel(
             coord = TelethonCoordinator(listener, scheduler)
             panel.bind_coordinator(coord)
             if not coord.start(cfg):
-                error("Telegram 后台未能启动：上一会话线程未退出，请稍候或重启程序。")
+                error_i18n("embed.tg_thread_stuck")
             coord_holder[0] = coord
         except Exception as exc:
-            error(f"Telegram 后台启动失败：{exc}\n{traceback.format_exc()}")
+            error_i18n("embed.tg_start_fail", exc=f"{exc}\n{traceback.format_exc()}")
 
     panel.after(0, start_backend)
 

@@ -33,6 +33,8 @@ def _split_blocks(text: str) -> List[str]:
 
 _KV_LINE = re.compile(r"^([^:：=＝]+)\s*[:：=＝]\s*(.*)$")
 _REMINDER_HEAD = re.compile(r"^[!！]\s*提醒\s*[!！]\s*$", re.IGNORECASE)
+_IMAGE_HEAD = re.compile(r"^\s*[!！]\s*发图\s*[!！]\s*$", re.IGNORECASE)
+_IMAGE_TYPE_VALS = frozenset({"发图", "图片", "image", "img", "photo", "sendimage", "send_image"})
 _DELAY_KEYS = frozenset({"间隔", "interval", "延迟", "delay", "间隔分钟", "等待", "等待分钟"})
 _REACTION_KEYS = frozenset({"点赞", "like", "反应", "react"})
 _REACTION_ONLY_LINE = re.compile(r"^\s*点赞\s*$", re.IGNORECASE)
@@ -121,10 +123,78 @@ def _try_parse_reminder_block(block: str) -> Optional[DocMessage]:
     )
 
 
+def _is_image_type_value(v: str) -> bool:
+    raw = (v or "").strip()
+    if not raw:
+        return False
+    if raw in _IMAGE_TYPE_VALS:
+        return True
+    return _norm_key(raw) in {_norm_key(x) for x in _IMAGE_TYPE_VALS}
+
+
+def _try_parse_image_send_block(block: str) -> Optional[DocMessage]:
+    """类型=发图 / !发图!：需账号；备注可选；不要求消息正文（与 TG 同格式）。"""
+    account_val = ""
+    note = ""
+    message_val = ""
+    delay_m: Optional[float] = 0.0
+    has_marker = False
+    for raw in block.splitlines():
+        s = raw.strip()
+        if not s or s.startswith("#") or s.startswith("//"):
+            continue
+        if _IMAGE_HEAD.match(s):
+            has_marker = True
+            continue
+        m = _KV_LINE.match(s)
+        if not m:
+            return None
+        k = _norm_key(m.group(1))
+        v = m.group(2).strip()
+        if k in ("账号", "account", "发送账号"):
+            account_val = v
+        elif k in ("消息", "内容", "message", "text", "msg"):
+            message_val = v
+        elif k in ("备注", "说明", "提示", "note", "caption"):
+            note = v
+        elif _norm_key(k) in _DELAY_KEYS:
+            parsed = _parse_delay_minutes_value(v)
+            if parsed is None:
+                return None
+            delay_m = parsed
+        elif k in ("类型", "kind", "type"):
+            if _is_image_type_value(v):
+                has_marker = True
+            else:
+                return None
+        else:
+            return None
+    if not has_marker:
+        return None
+    if not account_val.strip():
+        return None
+    if message_val.strip():
+        note = f"{note}\n{message_val}".strip() if note else message_val
+    d = 0.0 if delay_m is None else float(delay_m)
+    acc = account_val.strip()
+    return DocMessage(
+        account_id=acc,
+        content="",
+        is_reminder=False,
+        reminder_note=note,
+        delay_after_minutes=d,
+        want_reactions=False,
+        is_image_send=True,
+    )
+
+
 def _parse_block(block: str) -> Tuple[Optional[DocMessage], Optional[str]]:
     rem = _try_parse_reminder_block(block)
     if rem is not None:
         return rem, None
+    img = _try_parse_image_send_block(block)
+    if img is not None:
+        return img, None
     lines = block.splitlines()
     account = ""
     content = ""
@@ -211,6 +281,12 @@ def import_doc_items(text: str, valid_accounts: Optional[Set[str]] = None) -> Tu
         if item is None:
             continue
         if item.is_reminder:
+            out.append(item)
+            continue
+        if getattr(item, "is_image_send", False):
+            if valid_accounts is not None and item.account_id not in valid_accounts:
+                errs.append(f"第 {idx} 段：账号「{item.account_id}」未在账号管理中添加")
+                continue
             out.append(item)
             continue
         if valid_accounts is not None and item.account_id not in valid_accounts:

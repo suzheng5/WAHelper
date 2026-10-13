@@ -165,13 +165,20 @@ def mount_page_scroll(
 ) -> tuple[ctk.CTkFrame, tk.Canvas, Callable[[], None]]:
     """
     在 page 内挂载可滚动区域。
+    有 footer 时用 grid：滚动区占满剩余高度，底栏固定不挤没。
     返回 (inner, canvas, finish_scroll_bind)；构建完子控件后调用 finish_scroll_bind()。
     """
     if footer is not None:
-        footer.pack(side="bottom", fill="x", padx=0, pady=(10, 0))
-
-    holder = ctk.CTkFrame(page, fg_color="transparent")
-    holder.pack(fill="both", expand=True)
+        # grid 比 pack(side=bottom) 更稳：避免滚动区 expand 把底栏顶出可视区
+        page.grid_columnconfigure(0, weight=1)
+        page.grid_rowconfigure(0, weight=1)
+        page.grid_rowconfigure(1, weight=0)
+        holder = ctk.CTkFrame(page, fg_color="transparent")
+        holder.grid(row=0, column=0, sticky="nsew")
+        footer.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+    else:
+        holder = ctk.CTkFrame(page, fg_color="transparent")
+        holder.pack(fill="both", expand=True)
 
     scrollbar = ctk.CTkScrollbar(holder, orientation="vertical")
     canvas = tk.Canvas(holder, highlightthickness=0, bd=0, bg=bg)

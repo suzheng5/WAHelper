@@ -21,6 +21,7 @@ from config import (
     resolve_job_chat_targets,
 )
 from logger_util import error, info, warning
+from i18n.pause_reason import CODE_MANUAL, CODE_ROUND_COMPLETE, CODE_STARTUP_DOC
 from wa_jid import chat_matches_ref, parse_chat_ref_to_jid
 from wa_send import send_text_to_chats
 
@@ -34,6 +35,11 @@ class DocMessage:
     """本条执行完后的等待分钟数；None 表示使用任务界面上的默认间隔。"""
     delay_after_minutes: Optional[float] = None
     want_reactions: bool = False
+    """TXT「类型=发图」：不发送正文，暂停待任务管理一键发图。"""
+    is_image_send: bool = False
+
+    def is_non_send_step(self) -> bool:
+        return bool(self.is_reminder or self.is_image_send)
 
 
 @dataclass
@@ -179,7 +185,7 @@ def save_jobs(jobs: List[ScheduledJob]) -> None:
     os.replace(tmp, SCHEDULE_FILE)
 
 
-STARTUP_PAUSE_REASON = "程序启动后已自动暂停，请在定时任务中点「继续」后再运行。"
+STARTUP_PAUSE_REASON = CODE_STARTUP_DOC
 
 
 def pause_all_doc_jobs_on_startup(reason: str = STARTUP_PAUSE_REASON) -> int:
@@ -244,7 +250,7 @@ class ScheduleRunner:
     def stop(self) -> None:
         self._running = False
 
-    def pause_job(self, job_id: str, reason: str = "手动暂停") -> bool:
+    def pause_job(self, job_id: str, reason: str = CODE_MANUAL) -> bool:
         jobs = load_jobs()
         now = time.time()
         changed = False
@@ -342,7 +348,7 @@ class ScheduleRunner:
                     if item is None:
                         j.enabled = False
                         j.state = "paused"
-                        j.pause_reason = "一轮发送完成，任务自动停止"
+                        j.pause_reason = CODE_ROUND_COMPLETE
                         j.next_send_ts = 0.0
                         changed = True
                         continue
@@ -354,7 +360,7 @@ class ScheduleRunner:
                         if j.cursor >= len(j.items):
                             j.enabled = False
                             j.state = "paused"
-                            j.pause_reason = "一轮发送完成，任务自动停止"
+                            j.pause_reason = CODE_ROUND_COMPLETE
                             j.next_send_ts = 0.0
                         else:
                             j.next_send_ts = time.time() + _next_delay_seconds(j)
@@ -376,7 +382,7 @@ class ScheduleRunner:
                         if j.cursor >= len(j.items):
                             j.enabled = False
                             j.state = "paused"
-                            j.pause_reason = "一轮发送完成，任务自动停止"
+                            j.pause_reason = CODE_ROUND_COMPLETE
                             j.next_send_ts = 0.0
                             changed = True
                             continue

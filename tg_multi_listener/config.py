@@ -110,8 +110,9 @@ def parse_chat_ref_input(g: str) -> ChatRef:
         split_on = "telegram.me/" if "telegram.me/" in low else "t.me/"
         tail = t.split(split_on, 1)[-1]
         tail = tail.split("?", 1)[0].strip().strip("/")
+        # 私密邀请链接：原样保留，供发送前自动入群 / ImportChatInvite
         if tail.startswith("+") or "joinchat" in low:
-            raise ValueError("私密邀请链接无法在不入群时解析；请先加入该群，再用转发机器人取数字 ID")
+            return t.strip()
         segs = [s for s in tail.split("/") if s and s not in ("s", "c")]
         if not segs:
             raise ValueError("无法从链接中识别公开群名")
@@ -176,6 +177,8 @@ class AddressEntry:
     owner_account_id: str = ""
     """该群上一次成功发出的定时任务 TXT 文件名（仅文件名，持久化到 config）。"""
     last_schedule_source_name: str = ""
+    """邀请链接原文：chat_ref 被解析成数字 ID 后仍保留，供其它账号自动入群。"""
+    invite_link: str = ""
 
 
 def chat_peer_ids_for_match(chat_id: int) -> List[int]:
@@ -272,6 +275,109 @@ def resolve_job_chat_targets(cfg: "AppConfig", job: Any) -> List[Union[int, str]
         return out
     raw = getattr(job, "chat_ids", None) or []
     return [int(x) for x in raw]
+
+
+def find_invite_link_for_chat_ref(cfg: "AppConfig", chat_ref: Union[int, str]) -> str:
+    """按群 ID / 邀请链接在通讯录中找回 invite_link 或仍写在 chat_ref 上的邀请链接。"""
+    from .group_auto_join import tg_invite_hash
+
+    if isinstance(chat_ref, int):
+        href = ""
+        want_id = int(chat_ref)
+        want_inv = None
+    else:
+        href = (chat_ref or "").strip()
+        want_inv = tg_invite_hash(href)
+        want_id = chat_ref_to_optional_int(href)
+
+    if want_inv:
+        # 目标本身就是邀请链接
+        if href.lower().startswith("http") or "t.me/" in href.lower() or "telegram.me/" in href.lower():
+            return href
+        return f"https://t.me/+{want_inv}"
+
+    for ent in cfg.address_book:
+        raw = (ent.chat_ref or "").strip()
+        link = (getattr(ent, "invite_link", None) or "").strip()
+        n = chat_ref_to_optional_int(raw)
+        if want_id is not None and n is not None:
+            if set(chat_peer_ids_for_match(want_id)).intersection(chat_peer_ids_for_match(n)):
+                if link and tg_invite_hash(link):
+                    return link
+                if tg_invite_hash(raw):
+                    return raw
+        if want_inv and (tg_invite_hash(raw) == want_inv or tg_invite_hash(link) == want_inv):
+            return link or raw
+    return ""
+
+
+def persist_resolved_chat_id(
+    peer_id: int,
+    *,
+    invite_ref: str = "",
+    entry_id: str = "",
+) -> bool:
+    """
+    将解析到的群 ID 写回通讯录 chat_ref；若来源是邀请链接则保留到 invite_link。
+    返回是否有写入。
+    """
+    from .group_auto_join import tg_invite_hash
+
+    pid = int(peer_id)
+    new_ref = str(pid)
+    inv_ref = (invite_ref or "").strip()
+    inv_hash = tg_invite_hash(inv_ref) if inv_ref else None
+    eid = (entry_id or "").strip()
+
+    cfg = load_config()
+    changed = False
+    for ent in cfg.address_book:
+        if eid and ent.id != eid:
+            continue
+        raw = (ent.chat_ref or "").strip()
+        link = (ent.invite_link or "").strip()
+        match = False
+        if eid and ent.id == eid:
+            match = True
+        elif inv_hash and (tg_invite_hash(raw) == inv_hash or tg_invite_hash(link) == inv_hash):
+            match = True
+        else:
+            n = chat_ref_to_optional_int(raw)
+            if n is not None and set(chat_peer_ids_for_match(pid)).intersection(chat_peer_ids_for_match(n)):
+                match = True
+        if not match:
+            continue
+
+        # 保留邀请链接
+        src_invite = ""
+        if inv_hash:
+            if inv_ref and (inv_ref.lower().startswith("http") or "t.me/" in inv_ref.lower()):
+                src_invite = inv_ref
+            else:
+                src_invite = f"https://t.me/+{inv_hash}"
+        elif tg_invite_hash(raw):
+            src_invite = raw
+        if src_invite and (ent.invite_link or "").strip() != src_invite:
+            ent.invite_link = src_invite
+            changed = True
+        if raw != new_ref:
+            ent.chat_ref = new_ref
+            changed = True
+        if eid:
+            break
+
+    if changed:
+        try:
+            save_config(cfg)
+            from .logger_util import info
+
+            info(f"通讯录群 ID 已写回：{new_ref}" + (f"（保留邀请链接）" if inv_hash else ""))
+        except Exception as exc:
+            from .logger_util import warning
+
+            warning(f"写回通讯录群 ID 失败：{exc}")
+            return False
+    return changed
 
 
 def find_address_entry_for_peer(
@@ -423,6 +529,7 @@ class AppConfig:
     address_book: List[AddressEntry] = field(default_factory=list)
     rate_limit_seconds: float = 10.0
     listening_enabled: bool = True
+    stage_reminder_popup_enabled: bool = True
 
 
 def default_config() -> AppConfig:
@@ -434,6 +541,7 @@ def default_config() -> AppConfig:
         address_book=[],
         rate_limit_seconds=10.0,
         listening_enabled=True,
+        stage_reminder_popup_enabled=True,
     )
 
 
@@ -451,6 +559,7 @@ def _address_entry_from_dict(d: Dict[str, Any]) -> Optional[AddressEntry]:
         listen_enabled=bool(d.get("listen_enabled", True)),
         owner_account_id=str(d.get("owner_account_id", "") or "").strip(),
         last_schedule_source_name=str(d.get("last_schedule_source_name", "") or "").strip(),
+        invite_link=str(d.get("invite_link", "") or "").strip(),
     )
 
 
@@ -652,6 +761,7 @@ def load_config() -> AppConfig:
         address_book=address_book,
         rate_limit_seconds=float(raw.get("rate_limit_seconds", 10.0)),
         listening_enabled=bool(raw.get("listening_enabled", True)),
+        stage_reminder_popup_enabled=bool(raw.get("stage_reminder_popup_enabled", True)),
     )
 
 
@@ -665,6 +775,7 @@ def save_config(cfg: AppConfig) -> None:
         "address_book": [asdict(e) for e in cfg.address_book],
         "rate_limit_seconds": cfg.rate_limit_seconds,
         "listening_enabled": cfg.listening_enabled,
+        "stage_reminder_popup_enabled": cfg.stage_reminder_popup_enabled,
     }
     path = config_path()
     tmp = path + ".tmp"

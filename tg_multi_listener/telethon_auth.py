@@ -14,8 +14,9 @@ from telethon.errors import (
     SessionPasswordNeededError,
 )
 
+from i18n import t
 from .compat_config import Account, AppConfig, ensure_dirs
-from .logger_util import error, info
+from .logger_util import error_i18n, info
 from .ui.login_dialog import LoginUIBridge
 
 if TYPE_CHECKING:
@@ -44,14 +45,14 @@ def run_login_in_thread(
             try:
                 pre_login()
             except Exception as exc:
-                root.after(0, lambda: on_done(False, f"无法暂停后台 Telegram 服务：{exc}"))
+                root.after(0, lambda: on_done(False, t("login.tg.pre_login_fail", err=exc)))
                 return
         bridge = LoginUIBridge(root)
 
         async def inner() -> tuple[bool, str]:
             ensure_dirs()
             if not int(cfg.api_id) or not str(cfg.api_hash).strip():
-                return False, "请先在软件里填写共用的 API ID 与 API Hash（my.telegram.org）"
+                return False, t("login.tg.api_required")
             path = account.session_path()
             client = TelegramClient(path, cfg.api_id, cfg.api_hash)
             try:
@@ -61,70 +62,70 @@ def run_login_in_thread(
                     me = await client.get_me()
                     name = getattr(me, "username", None) or str(me.id)
                     await client.disconnect()
-                    return True, f"该 session 已登录：{name}"
+                    return True, t("login.tg.already", name=name)
 
                 phone = bridge.ask_string(
-                    "登录 · 第 1 步：手机号",
-                    "请输入 Telegram 绑定手机号（含国家区号，例如 +8613812345678）。",
-                    placeholder="+86",
+                    t("login.tg.step1_title"),
+                    t("login.tg.step1_prompt"),
+                    placeholder=t("login.tg.phone_ph"),
                 )
                 if not phone:
                     await client.disconnect()
-                    return False, "已取消"
+                    return False, t("login.tg.cancelled")
 
                 try:
                     await client.send_code_request(phone)
                 except PhoneNumberInvalidError:
                     await client.disconnect()
-                    return False, "手机号格式无效"
+                    return False, t("login.tg.phone_invalid")
                 except FloodWaitError as exc:
                     await client.disconnect()
-                    return False, f"请求过于频繁，请稍后再试（约 {exc.seconds}s）"
+                    return False, t("login.tg.flood_wait", seconds=exc.seconds)
                 except RPCError as exc:
                     await client.disconnect()
-                    return False, f"发送验证码失败：{exc}"
+                    return False, t("login.tg.code_send_fail", err=exc)
 
                 code = bridge.ask_string(
-                    "登录 · 第 2 步：验证码",
-                    "请输入短信或 Telegram 内收到的登录验证码（数字）。",
+                    t("login.tg.step2_title"),
+                    t("login.tg.step2_prompt"),
                 )
                 if not code:
                     await client.disconnect()
-                    return False, "已取消"
+                    return False, t("login.tg.cancelled")
 
                 try:
                     await client.sign_in(phone, code.strip())
                 except SessionPasswordNeededError:
                     pwd = bridge.ask_string(
-                        "登录 · 第 3 步：二步验证",
-                        "该账号开启了二步验证，请输入您的二步验证密码（不是登录验证码）。",
+                        t("login.tg.step3_title"),
+                        t("login.tg.step3_prompt"),
                         secret=True,
                     )
                     if not pwd:
                         await client.disconnect()
-                        return False, "已取消"
+                        return False, t("login.tg.cancelled")
                     await client.sign_in(password=pwd)
                 except PhoneCodeInvalidError:
                     await client.disconnect()
-                    return False, "验证码错误"
+                    return False, t("login.tg.code_invalid")
                 except RPCError as exc:
                     await client.disconnect()
-                    return False, f"登录失败：{exc}"
+                    return False, t("login.tg.login_fail", err=exc)
 
                 if not await client.is_user_authorized():
                     await client.disconnect()
-                    return False, "登录未完成"
+                    return False, t("login.tg.incomplete")
 
                 me = await client.get_me()
                 label = getattr(me, "username", None) or str(me.id)
                 await client.disconnect()
-                return True, f"登录成功：{label}"
+                return True, t("login.tg.success", label=label)
             except Exception as exc:
                 try:
                     await client.disconnect()
                 except Exception:
                     pass
-                error(f"登录异常：{exc}")
+                error_i18n("login.tg.exception", err=exc)
                 return False, str(exc)
 
         try:

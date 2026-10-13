@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import traceback
 
 from platform_paths import tg_data_root
@@ -13,10 +14,21 @@ def _prime_tg_data_root() -> None:
     os.environ.setdefault("TG_HELPER_DATA_ROOT", tg_data_root())
 
 
-def main() -> None:
-    bootstrap_wa_runtime()
-    _prime_tg_data_root()
-    bootstrap_wa_logging()
+def _selected_ui() -> str:
+    value = os.environ.get("WA_UI_BACKEND", "qt").strip().lower()
+    for index, arg in enumerate(sys.argv[1:]):
+        if arg.startswith("--ui="):
+            value = arg.partition("=")[2].strip().lower()
+        elif arg == "--ui" and index + 2 <= len(sys.argv) - 1:
+            value = sys.argv[index + 2].strip().lower()
+    return value if value in {"qt", "tk"} else "qt"
+
+
+def _run_tk() -> None:
+    from wa_ui.activation_dialog import ensure_activated
+
+    if not ensure_activated():
+        return
 
     from wa_ui.shell import run_shell
 
@@ -34,7 +46,8 @@ def main() -> None:
             listener=app._wa_listener,
             schedule2=app._wa_schedule2,
             login_cancel=getattr(app._wa_panel, "_login_cancel", None) if app._wa_panel else None,
-            join_timeout=10.0,
+            join_timeout=2.0,
+            kill_children=False,
         )
         if app._tg_shutdown_fn:
             try:
@@ -42,6 +55,27 @@ def main() -> None:
             except Exception:
                 pass
         force_process_exit()
+
+
+def main() -> None:
+    bootstrap_wa_runtime()
+    _prime_tg_data_root()
+    bootstrap_wa_logging()
+
+    from i18n import init_i18n
+
+    init_i18n()
+
+    if _selected_ui() == "tk":
+        _run_tk()
+        return
+
+    from qt_ui.entry import run_qt
+
+    run_qt()
+    from shutdown import force_process_exit
+
+    force_process_exit()
 
 
 if __name__ == "__main__":
